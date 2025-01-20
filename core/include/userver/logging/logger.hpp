@@ -7,8 +7,8 @@
 #include <string>
 
 #include <userver/logging/format.hpp>
+#include <userver/logging/fwd.hpp>
 #include <userver/logging/level.hpp>
-#include <userver/logging/null_logger.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -21,32 +21,33 @@ void LogRaw(LoggerBase& logger, Level level, std::string_view message);
 
 }  // namespace impl
 
-using LoggerPtr = std::shared_ptr<impl::LoggerBase>;
-
 /// @brief Creates synchronous stderr logger with default tskv pattern
 /// @param name logger name, for internal use, must be unique
 /// @see components::Logging
-LoggerPtr MakeStderrLogger(const std::string& name, Format format,
-                           Level level = Level::kInfo);
-
-// TODO: remove after userver up
-inline LoggerPtr MakeStderrLogger(const std::string& name,
-                                  Level level = Level::kInfo) {
-  return logging::MakeStderrLogger(name, Format::kTskv, level);
-}
+LoggerPtr MakeStderrLogger(const std::string& name, Format format, Level level = Level::kInfo);
 
 /// @brief Creates synchronous stdout logger with default tskv pattern
 /// @param name logger name, for internal use, must be unique
 /// @see components::Logging
-LoggerPtr MakeStdoutLogger(const std::string& name, Format format,
-                           Level level = Level::kInfo);
+LoggerPtr MakeStdoutLogger(const std::string& name, Format format, Level level = Level::kInfo);
 
 /// @brief Creates synchronous file logger with default tskv pattern
 /// @param name logger name, for internal use, must be unique
 /// @param path target log file path
 /// @see components::Logging
-LoggerPtr MakeFileLogger(const std::string& name, const std::string& path,
-                         Format format, Level level = Level::kInfo);
+LoggerPtr MakeFileLogger(const std::string& name, const std::string& path, Format format, Level level = Level::kInfo);
+
+namespace impl {
+class TagWriter;
+}
+
+namespace impl::default_ {
+
+bool DoShouldLog(Level) noexcept;
+
+void PrependCommonTags(TagWriter writer);
+
+}  // namespace impl::default_
 
 }  // namespace logging
 

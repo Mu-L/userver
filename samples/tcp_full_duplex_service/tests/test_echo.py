@@ -22,15 +22,15 @@ def monitor_port(service_port) -> int:
     return service_port
 
 
-async def send_all_data(s, loop):
+async def send_all_data(sock, loop):
     for data in DATA:
-        await loop.sock_sendall(s, data)
+        await loop.sock_sendall(sock, data)
 
 
-async def recv_all_data(s, loop):
+async def recv_all_data(sock, loop):
     answer = b''
     while len(answer) < DATA_LENGTH:
-        answer += await loop.sock_recv(s, DATA_LENGTH - len(answer))
+        answer += await loop.sock_recv(sock, DATA_LENGTH - len(answer))
 
     assert answer == b''.join(DATA)
 
@@ -64,10 +64,10 @@ async def _gate(loop, tcp_service_port):
 
 async def test_delay_recv(service_client, loop, monitor_client, gate):
     await service_client.reset_metrics()
-    TIMEOUT = 10.0
+    timeout = 10.0
 
     # respond with delay in TIMEOUT seconds
-    gate.to_client_delay(TIMEOUT)
+    gate.to_client_delay(timeout)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     await loop.sock_connect(sock, gate.get_sockname_for_clients())
@@ -77,7 +77,9 @@ async def test_delay_recv(service_client, loop, monitor_client, gate):
     await send_all_data(sock, loop)
 
     done, _ = await asyncio.wait(
-        [recv_task], timeout=TIMEOUT / 2, return_when=asyncio.FIRST_COMPLETED,
+        [recv_task],
+        timeout=timeout / 2,
+        return_when=asyncio.FIRST_COMPLETED,
     )
     assert not done
 
@@ -117,7 +119,7 @@ async def test_down_pending_recv(service_client, loop, gate):
     await loop.sock_connect(sock, gate.get_sockname_for_clients())
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    async def _recv_no_data(s, loop):
+    async def _recv_no_data():
         answer = b''
         try:
             while True:
@@ -128,12 +130,14 @@ async def test_down_pending_recv(service_client, loop, gate):
 
         assert answer == b''
 
-    recv_task = asyncio.create_task(_recv_no_data(sock, loop))
+    recv_task = asyncio.create_task(_recv_no_data())
 
     await send_all_data(sock, loop)
 
     await asyncio.wait(
-        [recv_task], timeout=1, return_when=asyncio.FIRST_COMPLETED,
+        [recv_task],
+        timeout=1,
+        return_when=asyncio.FIRST_COMPLETED,
     )
     await gate.sockets_close()
     await recv_task
@@ -150,7 +154,10 @@ async def test_down_pending_recv(service_client, loop, gate):
 
 
 async def test_multiple_socks(
-        service_client, loop, monitor_client, tcp_service_port,
+    service_client,
+    loop,
+    monitor_client,
+    tcp_service_port,
 ):
     await service_client.reset_metrics()
     sockets_count = 250
@@ -166,13 +173,14 @@ async def test_multiple_socks(
 
     metrics = await monitor_client.metrics(prefix='tcp-echo.')
     assert metrics.value_at('tcp-echo.sockets.opened') == sockets_count
-    assert (
-        metrics.value_at('tcp-echo.bytes.read') == DATA_LENGTH * sockets_count
-    )
+    assert metrics.value_at('tcp-echo.bytes.read') == DATA_LENGTH * sockets_count
 
 
 async def test_multiple_send_only(
-        service_client, loop, monitor_client, tcp_service_port,
+    service_client,
+    loop,
+    monitor_client,
+    tcp_service_port,
 ):
     await service_client.reset_metrics()
     sockets_count = 25

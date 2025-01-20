@@ -1,9 +1,7 @@
 import pytest
-
 from pytest_userver import chaos
 
 from testsuite.databases.mongo import connection
-
 
 pytest_plugins = ['pytest_userver.plugins.mongo']
 
@@ -20,13 +18,19 @@ MONGO_COLLECTIONS = {
 
 
 @pytest.fixture(scope='session')
+def userver_testsuite_middleware_enabled():
+    return False
+
+
+@pytest.fixture(scope='session')
 def mongodb_settings():
     return MONGO_COLLECTIONS
 
 
 @pytest.fixture(scope='session')
 async def _gate_started(
-        loop, mongo_connection_info: connection.ConnectionInfo,
+    loop,
+    mongo_connection_info: connection.ConnectionInfo,
 ):
     gate_config = chaos.GateRoute(
         name='mongo proxy',

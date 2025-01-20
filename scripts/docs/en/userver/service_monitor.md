@@ -3,6 +3,11 @@
 If your service has a server::handlers::ServerMonitor configured, then you may
 get the service statistics and metrics.
 
+To produce metrics in declarative style refer to the docs of the
+utils::statistics::MetricTag; to register your metrics writer on per component
+basis refer to the docs of utils::statistics::Writer. To test metrics refer to
+the @ref TESTSUITE_METRICS_TESTING "testsuite metrics testing".
+
 
 ## Commands
 
@@ -12,11 +17,11 @@ at server::handlers::ServerMonitor.
 The simplest way to experiment with metrics is to start a sample by running
 `make start-userver-samples-production_service` from the build directory and
 make some requests from another terminal window, for example
-`curl 'http://localhost:8086/service/monitor?format=prometheus'`.
+`curl http://localhost:8086/service/monitor?format=prometheus`.
 
 Note that the server::handlers::ServerMonitor handler lives at the separate
 `components.server.listener-monitor` address, so you have to request them using the
-`listener-monitor` credentials. See @ref md_en_userver_tutorial_production_service
+`listener-monitor` credentials. See @ref scripts/docs/en/userver/tutorial/production_service.md
 for more info on configuration and ideas on how to change the
 `/service/monitor` handle path.
 
@@ -50,7 +55,7 @@ dns_client_replies{dns_reply_source="cached-stale"} 0
 dns_client_replies{dns_reply_source="cached-failure"} 0
 dns_client_replies{dns_reply_source="network"} 0
 dns_client_replies{dns_reply_source="network-failure"} 0
-``` 
+```
 
 
 ### Graphite metrics by path
@@ -65,25 +70,32 @@ engine.load-ms 160 1665765043
 ```
 
 
-### Get all the metrics in Graphite format
+### Metrics Description
 
 The amount of metrics depends on components count, threads count,
 utils::statistics::MetricTag usage and configuration options.
 ```
 bash
-$ curl http://localhost:8086/service/monitor?format=graphite | sort
+$ curl http://localhost:8086/service/monitor?format=pretty | sort
+```
+
+Each metric is written in human readable format:
+```
+metric-path: label1=value1, label2=value2 METRIC_TYPE value
 ```
 
 @include core/functional_tests/metrics/tests/static/metrics_values.txt
 
 
-With components::Postgres and some components::PostgreCache the following
-additional metrics appear:
+With components::Postgres, some components::PostgreCache and some
+storages::postgres::DistLockComponentBase the following additional metrics
+appear:
 
 @include postgresql/functional_tests/metrics/tests/static/metrics_values.txt
 
 
-With components::Mongo the following additional metrics appear:
+With components::Mongo and some storages::mongo::DistLockComponentBase the
+following additional metrics appear:
 
 @include mongo/functional_tests/metrics/tests/static/metrics_values.txt
 
@@ -98,9 +110,19 @@ With components::ClickHouse the following additional metrics appear:
 @include clickhouse/functional_tests/metrics/tests/static/metrics_values.txt
 
 
+With components::RabbitMQ the following additional metrics appear:
+
+@include rabbitmq/functional_tests/metrics/tests/static/metrics_values.txt
+
+
+With grpc client and server the following additional metrics appear:
+
+@include grpc/functional_tests/metrics/tests/static/metrics_values.txt
+
+
 ----------
 
 @htmlonly <div class="bottom-nav"> @endhtmlonly
-⇦ @ref md_en_userver_requests_in_flight | @ref md_en_userver_memory_profile_running_service ⇨
+⇦ @ref scripts/docs/en/userver/requests_in_flight.md | @ref scripts/docs/en/userver/memory_profile_running_service.md ⇨
 @htmlonly </div> @endhtmlonly
 

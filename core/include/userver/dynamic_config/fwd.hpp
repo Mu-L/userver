@@ -9,15 +9,20 @@ namespace components {
 
 // NOLINTNEXTLINE(bugprone-forward-declaration-namespace)
 class DynamicConfig;
+class DynamicConfigUpdatesSinkBase;
 
 }  // namespace components
 
 namespace dynamic_config {
 
+struct Diff;
 class DocsMap;
 class KeyValue;
 class Snapshot;  // NOLINT(bugprone-forward-declaration-namespace)
 class Source;
+
+template <typename Variable>
+class Key;
 
 }  // namespace dynamic_config
 

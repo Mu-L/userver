@@ -1,6 +1,7 @@
 async def test_basic(service_client, monitor_client):
     response = await service_client.get('/metrics')
     assert response.status_code == 200
+    assert 'application/json' in response.headers['Content-Type']
 
     metric = await monitor_client.single_metric('sample-metrics.foo')
     assert metric.value > 0
@@ -18,6 +19,7 @@ async def test_reset(service_client, monitor_client):
 
     response = await service_client.get('/metrics')
     assert response.status_code == 200
+    assert 'application/json' in response.headers['Content-Type']
 
     metric = await monitor_client.single_metric('sample-metrics.foo')
     assert metric.value == 1
@@ -37,7 +39,8 @@ async def test_engine_metrics(service_client, monitor_client):
     assert metric.labels == {'task_processor': 'main-task-processor'}
 
     metrics_dict = await monitor_client.metrics(
-        prefix='http.', labels={'http_path': '/ping'},
+        prefix='http.',
+        labels={'http_path': '/ping'},
     )
 
     assert metrics_dict
@@ -46,15 +49,11 @@ async def test_engine_metrics(service_client, monitor_client):
     assert (
         metrics_dict.value_at(
             'http.handler.in-flight',
-            labels={'http_path': '/ping', 'http_handler': 'handler-ping'},
-        )
-        == 0
-    )
-
-    assert (
-        metrics_dict.value_at(
-            'http.handler.in-flight',
-            labels={'http_handler': 'handler-ping', 'http_path': '/ping'},
+            labels={
+                'http_path': '/ping',
+                'http_handler': 'handler-ping',
+                'version': '2',
+            },
         )
         == 0
     )

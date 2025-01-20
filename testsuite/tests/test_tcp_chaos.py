@@ -10,7 +10,6 @@ import uuid
 import pytest
 from pytest_userver import chaos  # pylint: disable=import-error
 
-
 _NOTICEABLE_DELAY = 0.5
 
 
@@ -34,7 +33,9 @@ def _make_nonblocking(sock: socket.socket) -> None:
 
 
 async def _assert_data_from_to(
-        sock_from: socket.socket, sock_to: socket.socket, loop,
+    sock_from: socket.socket,
+    sock_to: socket.socket,
+    loop,
 ) -> None:
     logger.debug('_assert_data_from_to sendall to %s', sock_from.getsockname())
     expected = b'pong_' + uuid.uuid4().bytes
@@ -43,6 +44,17 @@ async def _assert_data_from_to(
     data = await loop.sock_recv(sock_to, len(expected))
     assert data == expected
     logger.debug('_assert_data_from_to done')
+
+
+async def _assert_receive_timeout(sock: socket.socket, loop) -> None:
+    try:
+        data = await asyncio.wait_for(
+            loop.sock_recv(sock, 1),
+            _NOTICEABLE_DELAY,
+        )
+        assert not data
+    except asyncio.TimeoutError:
+        pass
 
 
 async def _assert_connection_dead(sock: socket.socket, loop) -> None:
@@ -109,6 +121,7 @@ async def _client(loop, gate):
 @pytest.fixture(name='server_connection', scope='function')
 async def _server_connection(loop, tcp_server, gate):
     sock = await tcp_server.accept()
+    await gate.wait_for_connections(count=1)
     assert gate.connections_count() >= 1
     yield sock
     sock.close()
@@ -145,14 +158,36 @@ async def test_to_server_noop(tcp_client, gate, server_connection, loop):
     assert not _has_data(server_connection)
 
     gate.to_server_pass()
-    server_incomming_data = await loop.sock_recv(server_connection, 4)
-    assert server_incomming_data == b'ping'
+    server_incoming_data = await loop.sock_recv(server_connection, 4)
+    assert server_incoming_data == b'ping'
     await _assert_data_from_to(server_connection, tcp_client, loop)
     await _assert_data_from_to(tcp_client, server_connection, loop)
 
 
+async def test_to_client_drop(tcp_client, gate, server_connection, loop):
+    gate.to_client_drop()
+
+    await loop.sock_sendall(server_connection, b'ping')
+    await _assert_data_from_to(tcp_client, server_connection, loop)
+    assert not _has_data(tcp_client)
+
+    gate.to_client_pass()
+    await _assert_receive_timeout(tcp_client, loop)
+
+
+async def test_to_server_drop(tcp_client, gate, server_connection, loop):
+    gate.to_server_drop()
+
+    await loop.sock_sendall(tcp_client, b'ping')
+    await _assert_data_from_to(server_connection, tcp_client, loop)
+    assert not _has_data(server_connection)
+
+    gate.to_server_pass()
+    await _assert_receive_timeout(server_connection, loop)
+
+
 async def test_to_client_delay(tcp_client, gate, server_connection, loop):
-    gate.to_client_delay(_NOTICEABLE_DELAY)
+    gate.to_client_delay(2 * _NOTICEABLE_DELAY)
 
     await _assert_data_from_to(tcp_client, server_connection, loop)
 
@@ -162,7 +197,7 @@ async def test_to_client_delay(tcp_client, gate, server_connection, loop):
 
 
 async def test_to_server_delay(tcp_client, gate, server_connection, loop):
-    gate.to_server_delay(_NOTICEABLE_DELAY)
+    gate.to_server_delay(2 * _NOTICEABLE_DELAY)
 
     await _assert_data_from_to(server_connection, tcp_client, loop)
 
@@ -172,7 +207,11 @@ async def test_to_server_delay(tcp_client, gate, server_connection, loop):
 
 
 async def test_to_client_close_on_data(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_client_close_on_data()
     tcp_client2 = await _make_client(loop, gate)
@@ -192,7 +231,11 @@ async def test_to_client_close_on_data(
 
 
 async def test_to_server_close_on_data(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_server_close_on_data()
     tcp_client2 = await _make_client(loop, gate)
@@ -212,7 +255,11 @@ async def test_to_server_close_on_data(
 
 
 async def test_to_client_corrupt_data(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_client_corrupt_data()
     tcp_client2 = await _make_client(loop, gate)
@@ -235,7 +282,11 @@ async def test_to_client_corrupt_data(
 
 
 async def test_to_server_corrupt_data(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_server_corrupt_data()
     tcp_client2 = await _make_client(loop, gate)
@@ -294,7 +345,11 @@ async def test_to_server_limit_bps(tcp_client, gate, server_connection, loop):
 
 
 async def test_to_client_limit_time(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_client_limit_time(_NOTICEABLE_DELAY, jitter=0.0)
     tcp_client2 = await _make_client(loop, gate)
@@ -318,7 +373,11 @@ async def test_to_client_limit_time(
 
 
 async def test_to_server_limit_time(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_server_limit_time(_NOTICEABLE_DELAY, jitter=0.0)
     tcp_client2 = await _make_client(loop, gate)
@@ -342,7 +401,10 @@ async def test_to_server_limit_time(
 
 
 async def test_to_client_smaller_parts(
-        tcp_client, gate, server_connection, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    loop,
 ):
     gate.to_client_smaller_parts(2)
 
@@ -360,7 +422,10 @@ async def test_to_client_smaller_parts(
 
 
 async def test_to_server_smaller_parts(
-        tcp_client, gate, server_connection, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    loop,
 ):
     gate.to_server_smaller_parts(2)
 
@@ -410,7 +475,11 @@ async def test_to_server_concat(tcp_client, gate, server_connection, loop):
 
 
 async def test_to_client_limit_bytes(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_client_limit_bytes(12)
     tcp_client2 = await _make_client(loop, gate)
@@ -448,7 +517,11 @@ async def test_to_client_limit_bytes(
 
 
 async def test_to_server_limit_bytes(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_server_limit_bytes(8)
     tcp_client2 = await _make_client(loop, gate)
@@ -473,7 +546,11 @@ async def test_to_server_limit_bytes(
 
 
 async def test_substitute(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     gate.to_server_substitute('hello', 'die')
     gate.to_client_substitute('hello', 'die')
@@ -491,7 +568,11 @@ async def test_substitute(
 
 
 async def test_wait_for_connections(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     assert gate.connections_count() == 1
     await gate.wait_for_connections(count=1, timeout=_NOTICEABLE_DELAY)
@@ -499,11 +580,8 @@ async def test_wait_for_connections(
     await _assert_data_from_to(server_connection, tcp_client, loop)
     await _assert_data_from_to(tcp_client, server_connection, loop)
 
-    try:
+    with pytest.raises(asyncio.TimeoutError):
         await gate.wait_for_connections(count=2, timeout=_NOTICEABLE_DELAY)
-        assert False
-    except asyncio.TimeoutError:
-        pass
 
     tcp_client2 = await _make_client(loop, gate)
     server_connection2 = await tcp_server.accept()
@@ -518,7 +596,11 @@ async def test_wait_for_connections(
 
 
 async def test_start_stop_accepting(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     await gate.stop_accepting()
 
@@ -527,14 +609,11 @@ async def test_start_stop_accepting(
 
     tcp_client2 = await _make_client(loop, gate)
 
-    try:
+    with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
             asyncio.create_task(tcp_server.accept()),
             timeout=_NOTICEABLE_DELAY,
         )
-        assert False
-    except asyncio.TimeoutError:
-        pass
 
     gate.start_accepting()
 
@@ -546,26 +625,24 @@ async def test_start_stop_accepting(
 
 
 async def test_start_stop_gate(
-        tcp_client, gate, server_connection, tcp_server, loop,
+    tcp_client,
+    gate,
+    server_connection,
+    tcp_server,
+    loop,
 ):
     assert gate.connections_count() == 1
     await gate.stop()
     assert gate.connections_count() == 0
 
-    try:
+    with pytest.raises(ConnectionRefusedError):
         await _make_client(loop, gate)
-        assert False
-    except ConnectionRefusedError:
-        pass
 
-    try:
+    with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
             asyncio.create_task(tcp_server.accept()),
             timeout=_NOTICEABLE_DELAY,
         )
-        assert False
-    except asyncio.TimeoutError:
-        pass
 
     gate.start()
     tcp_client2 = await _make_client(loop, gate)

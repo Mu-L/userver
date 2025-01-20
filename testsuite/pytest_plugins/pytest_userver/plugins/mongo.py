@@ -7,7 +7,6 @@ import re
 
 import pytest
 
-
 pytest_plugins = [
     'testsuite.databases.mongo.pytest_plugin',
     'pytest_userver.plugins.core',
@@ -22,8 +21,9 @@ def userver_mongo_config(mongo_connection_info):
     """
     Returns a function that adjusts the static configuration file for
     the testsuite.
-    Sets the `dbconnection` of to the testsuite started Mongo credentials if
-    the `dbconnection` starts with `mongodb://`.
+    Sets the `dbconnection` to the testsuite started MongoDB credentials if
+    the `dbconnection` starts with `mongodb://`. Additionally
+    increases MongoDB connection timeouts to 30 seconds.
 
     @ingroup userver_testsuite_fixtures
     """
@@ -35,12 +35,23 @@ def userver_mongo_config(mongo_connection_info):
     def _patch_config(config_yaml, config_vars):
         components = config_yaml['components_manager']['components']
         for _, params in components.items():
+            uri = ''
+
+            if params and 'dbconnection#fallback' in params:
+                uri = params['dbconnection#fallback']
+
             if params and 'dbconnection' in params:
-                params['dbconnection'] = re.sub(
-                    'mongodb://[^:]+:\\d+/', new_uri, params['dbconnection'],
-                )
-                params['dbconnection'] = re.sub(
-                    'mongodb://[^:]+/', new_uri, params['dbconnection'],
-                )
+                uri = params['dbconnection']
+
+            if not uri or not uri.startswith('mongodb://'):
+                continue
+
+            uri = re.sub('mongodb://[^:]+:\\d+/', new_uri, uri)
+            uri = re.sub('mongodb://[^:]+/', new_uri, uri)
+
+            params['dbconnection'] = uri
+            params['conn_timeout'] = '30s'
+            params['so_timeout'] = '30s'
+            params.pop('dbalias', None)
 
     return _patch_config

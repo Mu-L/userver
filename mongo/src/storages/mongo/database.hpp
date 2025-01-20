@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include <userver/storages/mongo/collection.hpp>
 
@@ -11,18 +12,20 @@ USERVER_NAMESPACE_BEGIN
 namespace storages::mongo::impl {
 
 class Database {
- public:
-  Database(PoolImplPtr pool, std::string database_name);
+public:
+    Database(PoolImplPtr pool, std::string database_name);
 
-  void DropDatabase();
+    void DropDatabase();
 
-  bool HasCollection(const std::string& collection_name) const;
+    bool HasCollection(const std::string& collection_name) const;
 
-  Collection GetCollection(std::string collection_name) const;
+    Collection GetCollection(std::string collection_name) const;
 
- private:
-  PoolImplPtr pool_;
-  std::string database_name_;
+    std::vector<std::string> ListCollectionNames() const;
+
+private:
+    PoolImplPtr pool_;
+    std::string database_name_;
 };
 
 }  // namespace storages::mongo::impl

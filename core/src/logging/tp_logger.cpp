@@ -1,283 +1,319 @@
 #include "tp_logger.hpp"
 
-// this header must be included before any spdlog headers
-// to override spdlog's level names
-#include <logging/spdlog.hpp>
-
-#include <memory>
-#include <string>
-
-#include <userver/concurrent/mpsc_queue.hpp>
-#include <userver/engine/sleep.hpp>
-#include <userver/logging/log.hpp>
-#include <userver/utils/overloaded.hpp>
+#include <fmt/format.h>
 
 #include <engine/task/task_context.hpp>
-#include <logging/spdlog_helpers.hpp>
+#include <userver/engine/async.hpp>
+#include <userver/engine/task/cancel.hpp>
+#include <userver/logging/impl/tag_writer.hpp>
+#include <userver/logging/logger.hpp>
+#include <userver/tracing/span.hpp>
+#include <userver/utils/enumerate.hpp>
+#include <userver/utils/fast_scope_guard.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
 namespace logging::impl {
 
 struct TpLogger::ActionVisitor final {
-  TpLogger& logger;
+    TpLogger& logger;
 
-  bool operator()(async::Log&& log) const {
-    logger.BackendLog(std::move(log));
-    return true;
-  }
+    void operator()(impl::async::Log&& log) const {
+        logger.AccountLogConsumed();
+        logger.BackendLog(std::move(log));
+    }
 
-  bool operator()(impl::async::Stop&&) const noexcept { return false; }
+    void operator()(impl::async::Stop&&) const noexcept {
+        // The consumer thread will check state_ later.
+    }
 
-  template <class Flush>
-  bool operator()(Flush&& flush) const {
-    logger.BackendFlush();
-    flush.promise.set_value();
-    return true;
-  }
+    void operator()(impl::async::ReopenCoro&& reopen) const noexcept {
+        try {
+            logger.BackendReopen(reopen.reopen_mode);
+            reopen.promise.set_value();
+        } catch (const std::exception& e) {
+            // For exceptions not inherited from std::exception, a broken promise will
+            // be thrown out of the future.
+            reopen.promise.set_exception(std::make_exception_ptr(e));
+        }
+    }
+
+    template <class Flush>
+    void operator()(Flush&& flush) const {
+        logger.BackendFlush();
+        flush.promise.set_value();
+    }
 };
 
-TpLogger::TpLogger(Format format, std::string logger_name)
-    : LoggerBase(format),
-      logger_name_(std::move(logger_name)),
-      formatter_pattern_(GetSpdlogPattern(format)),
-      queue_(Queue::Create(0)),
-      producer_(queue_->GetMultiProducer()) {
-  SetLevel(logging::Level::kInfo);
+TpLogger::TpLogger(Format format, std::string logger_name) : LoggerBase(format), logger_name_(std::move(logger_name)) {
+    SetLevel(logging::Level::kInfo);
 }
 
-void TpLogger::StartAsync(engine::TaskProcessor& task_processor,
-                          std::size_t max_queue_size,
-                          LoggerConfig::QueueOveflowBehavior overflow_policy) {
-  const auto was_async = in_async_mode_.exchange(true);
-  UINVARIANT(!was_async,
-             "Attempt to switch logger to async mode, while it is already in "
-             "that mode");
+void TpLogger::StartConsumerTask(
+    engine::TaskProcessor& task_processor,
+    std::size_t max_queue_size,
+    QueueOverflowBehavior overflow_policy
+) {
+    UINVARIANT(max_queue_size != 0 && max_queue_size <= (std::size_t{1} << 31), "Invalid max queue size");
+    max_queue_size_.store(max_queue_size);
+    overflow_policy_.store(overflow_policy);
 
-  overflow_policy_ = overflow_policy;
-  queue_->SetSoftMaxSize(max_queue_size);
-  consuming_task_ = engine::CriticalAsyncNoSpan(
-      task_processor, &TpLogger::ProcessingLoop, this);
+    auto expected = State::kSync;
+    const bool success = state_.compare_exchange_strong(expected, State::kAsync);
+    UINVARIANT(success, "Logger can only be switched to async mode once");
+
+    {
+        // Lock the consumer synchronously.
+        const engine::TaskCancellationBlocker block_cancel;
+        queue_consumer_ = queue_.WaitAndStartConsuming();
+    }
+
+    // Make sure to stop consuming even if Async throws.
+    utils::FastScopeGuard exit_async_guard([this]() noexcept {
+        state_.store(State::kSync);
+        queue_consumer_ = {};
+    });
+
+    consuming_task_ =
+        engine::CriticalAsyncNoSpan(task_processor, [this, guard = std::move(exit_async_guard)] { ProcessingLoop(); });
 }
 
 TpLogger::~TpLogger() {
-  UASSERT_MSG(
-      !in_async_mode_,
-      "We may be in non coroutine context, async logger must be in sync mode");
-  UASSERT_MSG(!consuming_task_.IsValid(),
-              "We may be in non coroutine context, async logger must be in "
-              "sync mode and consuming task must be stopped");
+    UASSERT_MSG(state_ == State::kSync, "We may be in non coroutine context, async logger must be in sync mode");
+    UASSERT_MSG(
+        !consuming_task_.IsValid(),
+        "We may be in non coroutine context, async logger must be in "
+        "sync mode and consuming task must be stopped"
+    );
 }
 
-void TpLogger::SwitchToSyncMode() {
-  const auto was_async = in_async_mode_.exchange(false);
-  if (!was_async) {
-    return;
-  }
-
-  ++pending_async_ops_;
-
-  // Some loggings could be in progress. To wait for those we send a Stop
-  // message by an explicit producer_.Push to avoid losing the message
-  // on overflow.
-
-  engine::TaskCancellationBlocker block_cancel;
-  const auto success = producer_.Push(impl::async::Stop{});
-  UASSERT(success);
-  consuming_task_.Wait();
-  consuming_task_ = {};
-}
-
-void TpLogger::Flush() const {
-  if (GetSinks().empty()) {
-    return;
-  }
-
-  ++pending_async_ops_;
-  if (!in_async_mode_) {
-    --pending_async_ops_;
-    BackendFlush();
-    return;
-  }
-
-  // Some loggings could be in progress. To wait for those we send a Flush
-  // message by an explicit producer_.Push to avoid losing the message
-  // on overflow.
-
-  if (engine::current_task::GetCurrentTaskContextUnchecked()) {
-    impl::async::FlushCoro action{};
-    auto future = action.promise.get_future();
-
-    engine::TaskCancellationBlocker block_cancel;
-    const auto success = producer_.Push(std::move(action));
-    UASSERT(success);
-    const auto result = future.wait();
-    UASSERT(result == engine::FutureStatus::kReady);
-  } else {
-    impl::async::FlushThreaded action{};
-    auto future = action.promise.get_future();
-
-    static constexpr std::size_t kMaxRepetitions = 5;
-    for (std::size_t repetitions = kMaxRepetitions; repetitions;
-         --repetitions) {
-      const auto success = producer_.PushNoblock(std::move(action));
-      if (success) {
-        future.wait();
-        break;
-      }
-
-      std::this_thread::yield();
+void TpLogger::StopConsumerTask() {
+    auto expected = State::kAsync;
+    if (!state_.compare_exchange_strong(expected, State::kStoppingAsync)) {
+        return;
     }
-  }
+
+    DoPush(stop_node_);
+
+    const engine::TaskCancellationBlocker block_cancel;
+    consuming_task_.Wait();
+    consuming_task_ = {};
 }
 
-void TpLogger::Log(Level level, std::string_view msg) const {
-  if (GetSinks().empty()) {
-    return;
-  }
+void TpLogger::Flush() {
+    if (GetSinks().empty()) {
+        return;
+    }
 
-  impl::async::Log action{level, std::string{msg}};
+    if (engine::current_task::IsTaskProcessorThread()) {
+        impl::async::FlushCoro action{};
+        auto future = action.promise.get_future();
 
-  ++pending_async_ops_;
-  if (!in_async_mode_) {
-    --pending_async_ops_;
-    BackendLog(std::move(action));
-    return;
-  }
+        Push(std::move(action));
 
-  Push(std::move(action));
+        const engine::TaskCancellationBlocker block_cancel;
+        future.get();
+    } else {
+        impl::async::FlushThreaded action{};
+        auto future = action.promise.get_future();
+
+        Push(std::move(action));
+
+        future.get();
+    }
 }
 
-void TpLogger::SetPattern(std::string pattern) {
-  formatter_pattern_ = std::move(pattern);
+impl::LogStatistics& TpLogger::GetStatistics() noexcept { return stats_; }
 
-  for (const auto& sink : GetSinks()) {
-    sink->set_pattern(formatter_pattern_);
-  }
+void TpLogger::Log(Level level, std::string_view msg) {
+    ++stats_.by_level[static_cast<std::size_t>(level)];
+
+    if (GetSinks().empty()) {
+        return;
+    }
+
+    if (TryWaitFreeQueueCapacity()) {
+        // The queue might have concurrently become full, in which case the size
+        // will temporarily go over the max size. The actual number of log actions
+        // in queue_ will not typically go over max_size + n_threads.
+        produced_->fetch_add(1);
+
+        try {
+            Push(impl::async::Log{level, std::string{msg}});
+        } catch (const std::exception&) {
+            // failed to construct a Log action or a node in Push
+            produced_->fetch_sub(1);
+            throw;
+        }
+    } else {
+        ++stats_.dropped;
+    }
 }
+
+void TpLogger::PrependCommonTags(TagWriter writer) const { impl::default_::PrependCommonTags(writer); }
+
+bool TpLogger::DoShouldLog(Level level) const noexcept { return impl::default_::DoShouldLog(level); }
 
 void TpLogger::AddSink(impl::SinkPtr&& sink) {
-  UASSERT(sink);
-  sink->set_level(spdlog::level::level_enum::trace);  // Always on
-  sink->set_pattern(formatter_pattern_);
-  sinks_.push_back(std::move(sink));
+    UASSERT(sink);
+    sinks_.push_back(std::move(sink));
 }
 
 const std::vector<impl::SinkPtr>& TpLogger::GetSinks() const { return sinks_; }
 
-std::string_view TpLogger::GetLoggerName() const noexcept {
-  return logger_name_;
+void TpLogger::Reopen(ReopenMode reopen_mode) {
+    if (GetSinks().empty()) {
+        return;
+    }
+
+    UASSERT(engine::current_task::IsTaskProcessorThread());
+    impl::async::ReopenCoro action{reopen_mode, {}};
+    auto future = action.promise.get_future();
+
+    Push(std::move(action));
+
+    const engine::TaskCancellationBlocker block_cancel;
+    future.get();
 }
+
+std::string_view TpLogger::GetLoggerName() const noexcept { return logger_name_; }
 
 void TpLogger::ProcessingLoop() {
-  auto consumer = queue_->GetConsumer();
+    const engine::TaskCancellationBlocker cancel_blocker;
 
-  // touching a local variable instead of a hot `pending_async_ops_` atomic
-  std::size_t processed = 0;
-
-  impl::async::Action incoming_async_action;
-  for (;;) {
-    if (!consumer.Pop(incoming_async_action)) {
-      // Producer is dead
-      break;
+    while (true) {
+        ConsumeQueueOnce(queue_consumer_);
+        if (state_ != State::kAsync) {
+            UASSERT(state_ == State::kStoppingAsync);
+            break;
+        }
+        queue_.WaitWhileEmpty(queue_consumer_);
     }
 
-    ++processed;
-    if (!KeepProcessing(std::move(incoming_async_action))) {
-      break;
-    }
-  }
-
-  // Process remaining messages from the queue after Stop received
-
-  while (consumer.PopNoblock(incoming_async_action)) {
-    ++processed;
-    KeepProcessing(std::move(incoming_async_action));
-  }
-
-  pending_async_ops_ -= processed;
-  while (pending_async_ops_) {
-    engine::Yield();
-    while (consumer.PopNoblock(incoming_async_action)) {
-      --pending_async_ops_;
-      KeepProcessing(std::move(incoming_async_action));
-    }
-  }
+    CleanUpQueue(std::move(queue_consumer_));
 }
 
-bool TpLogger::KeepProcessing(impl::async::Action&& action) noexcept {
-  try {
-    return std::visit(ActionVisitor{*this}, std::move(action));
-  } catch (const std::exception& e) {
-    UASSERT_MSG(false, fmt::format("Exception while doing an async logging: {}",
-                                   e.what()));
-  }
-
-  // ActionVisitor::operator() for Stop is noexcept, other operators return true
-  return true;
+void TpLogger::BackendPerform(impl::async::Action&& action) noexcept {
+    try {
+        std::visit(ActionVisitor{*this}, std::move(action));
+    } catch (const std::exception& e) {
+        UASSERT_MSG(false, fmt::format("Exception while doing an async logging: {}", e.what()));
+    }
 }
 
-void TpLogger::Push(impl::async::Log&& action) const {
-  bool success = false;
+bool TpLogger::HasFreeQueueCapacity() noexcept {
+    return produced_->load() - consumed_->load() < max_queue_size_.load();
+}
 
-  // Do not do blocking push if we are not in a coroutine context
-  if (overflow_policy_ == LoggerConfig::QueueOveflowBehavior::kBlock &&
-      engine::current_task::GetCurrentTaskContextUnchecked()) {
-    engine::TaskCancellationBlocker block_cancel;
-    success = producer_.Push(std::move(action));
-  } else {
-    UASSERT(overflow_policy_ == LoggerConfig::QueueOveflowBehavior::kDiscard ||
-            !engine::current_task::GetCurrentTaskContextUnchecked());
+bool TpLogger::TryWaitFreeQueueCapacity() {
+    if (HasFreeQueueCapacity()) {
+        return true;
+    }
 
-    // TODO: uncomment in TAXICOMMON-6088
-    // UASSERT_MSG(DefaultLogger().get() != this,
-    //            "Default logger should not be set to blocking mode");
+    // Do not do blocking push if we are not in a coroutine context.
+    if (overflow_policy_.load() != QueueOverflowBehavior::kBlock || !engine::current_task::IsTaskProcessorThread()) {
+        return false;
+    }
 
-    success = producer_.PushNoblock(std::move(action));
-  }
+    const engine::TaskCancellationBlocker block_cancel;
+    std::unique_lock lock{capacity_waiters_mutex_};
+    [[maybe_unused]] const bool success = capacity_waiters_cv_.Wait(lock, [this] { return HasFreeQueueCapacity(); });
+    UASSERT(success);
+    return true;
+}
 
-  if (!success) {
-    --pending_async_ops_;
-  }
+void TpLogger::Push(impl::async::Action&& action) {
+    auto node = std::make_unique<impl::async::ActionNode>();
+    node->action = std::move(action);
+    DoPush(*node.release());
+}
+
+void TpLogger::DoPush(concurrent::impl::SinglyLinkedBaseHook& node) noexcept {
+    auto consumer = queue_.PushAndTryStartConsuming(node);
+    if (consumer.IsValid()) {
+        CleanUpQueue(std::move(consumer));
+    }
+}
+
+void TpLogger::AccountLogConsumed() noexcept {
+    consumed_->store(consumed_->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    if (overflow_policy_.load() == QueueOverflowBehavior::kBlock) {
+        {
+            // Atomic consumed_ mutation doesn't need to be protected by lock.
+            // With this lock in place, a waiter can check + wait either:
+            // 1. before us locking, then we will notify the waiter, or
+            // 2. after us locking, then the waiter will receive our updates and
+            //    not fall asleep
+            const std::lock_guard lock{capacity_waiters_mutex_};
+        }
+        capacity_waiters_cv_.NotifyOne();
+    }
+}
+
+void TpLogger::ConsumeNode(concurrent::impl::SinglyLinkedBaseHook& node) noexcept {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    auto& action_node = static_cast<impl::async::ActionNode&>(node);
+    if (&action_node == &stop_node_) return;
+
+    BackendPerform(std::move(action_node.action));
+    delete &action_node;
+}
+
+void TpLogger::ConsumeQueueOnce(Queue::Consumer& consumer) noexcept {
+    while (auto* const node_base = consumer.TryPop()) {
+        ConsumeNode(*node_base);
+    }
+}
+
+void TpLogger::CleanUpQueue(Queue::Consumer&& consumer) noexcept {
+    std::move(consumer).ConsumeAndStop([this](auto& node) noexcept { ConsumeNode(node); });
 }
 
 void TpLogger::BackendLog(impl::async::Log&& action) const {
-  spdlog::details::log_msg msg{};
-  msg.logger_name = GetLoggerName();
-  msg.level = static_cast<spdlog::level::level_enum>(action.level);
-  msg.time = action.time;
-  msg.payload = action.payload;
+    LogMessage message;
+    message.payload = action.payload;
+    message.level = action.level;
 
-  for (const auto& sink : GetSinks()) {
-    if (!sink->should_log(msg.level)) {
-      // We could get in here because of the LogRaw, or because log level
-      // was changed at runtime, or because socket sink is not listened by
-      // testsuite right now.
-      continue;
+    for (const auto& sink : GetSinks()) {
+        try {
+            sink->Log(message);
+        } catch (const std::exception& e) {
+            UASSERT_MSG(false, "While writing a log message caught an exception: " + std::string(e.what()));
+        }
     }
 
-    try {
-      sink->log(msg);
-    } catch (const std::exception& e) {
-      UASSERT_MSG(false, "While writing a log message caught an exception: " +
-                             std::string(e.what()));
+    if (ShouldFlush(message.level)) {
+        BackendFlush();
     }
-  }
-
-  if (ShouldFlush(action.level)) {
-    BackendFlush();
-  }
 }
 
 void TpLogger::BackendFlush() const {
-  for (const auto& sink : GetSinks()) {
-    try {
-      sink->flush();
-    } catch (const std::exception& e) {
-      UASSERT_MSG(false, "While flushing a log message caught an exception: " +
-                             std::string(e.what()));
+    for (const auto& sink : GetSinks()) {
+        try {
+            sink->Flush();
+        } catch (const std::exception& e) {
+            UASSERT_MSG(false, "While flushing a log message caught an exception: " + std::string(e.what()));
+        }
     }
-  }
+}
+
+void TpLogger::BackendReopen(ReopenMode reopen_mode) const {
+    std::string result_messages{};
+    for (const auto& [index, sink] : utils::enumerate(GetSinks())) {
+        try {
+            sink->Reopen(reopen_mode);
+        } catch (const std::exception& e) {
+            result_messages += e.what();
+            result_messages += "; ";
+            LOG_ERROR() << "Exception on log reopen in sink #" << index << " of logger '" << GetLoggerName()
+                        << "': " << e;
+        }
+    }
+    if (!result_messages.empty()) {
+        stats_.has_reopening_error.store(true);
+        throw std::runtime_error("BackendReopen errors: " + result_messages);
+    }
+    stats_.has_reopening_error.store(false);
 }
 
 }  // namespace logging::impl

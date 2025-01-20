@@ -2,22 +2,24 @@
 
 #include <chrono>
 
-#include <userver/dynamic_config/fwd.hpp>
 #include <userver/dynamic_config/snapshot.hpp>
+#include <userver/dynamic_config/value.hpp>
+
+#include <userver/storages/mongo/pool_config.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
 namespace storages::mongo {
 
-std::chrono::milliseconds ParseDefaultMaxTime(
-    const dynamic_config::DocsMap& docs_map);
+extern const dynamic_config::Key<dynamic_config::ValueDict<PoolSettings>> kPoolSettings;
 
-inline constexpr dynamic_config::Key<ParseDefaultMaxTime> kDefaultMaxTime;
+extern const dynamic_config::Key<std::chrono::milliseconds> kDefaultMaxTime;
 
-bool ParseDeadlinePropagationEnabled(const dynamic_config::DocsMap& docs_map);
+extern const dynamic_config::Key<bool> kDeadlinePropagationEnabled;
 
-inline constexpr dynamic_config::Key<ParseDeadlinePropagationEnabled>
-    kDeadlinePropagationEnabled;
+extern const dynamic_config::Key<bool> kCongestionControlEnabled;
+
+extern const dynamic_config::Key<dynamic_config::ValueDict<bool>> kCongestionControlDatabasesSettings;
 
 }  // namespace storages::mongo
 

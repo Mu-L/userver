@@ -12,41 +12,53 @@ namespace server::handlers {
 
 namespace {
 
-auto ParseContentTypeMap(const dynamic_config::DocsMap& docs_map) {
-  return docs_map.Get("USERVER_FILES_CONTENT_TYPE_MAP")
-      .As<dynamic_config::ValueDict<std::string>>();
+const dynamic_config::Key<dynamic_config::ValueDict<std::string>> kContentTypeMap{
+    "USERVER_FILES_CONTENT_TYPE_MAP",
+    dynamic_config::DefaultAsJsonString{
+        R"(
+{
+  ".css": "text/css",
+  ".gif": "image/gif",
+  ".htm": "text/html",
+  ".html": "text/html",
+  ".jpeg": "image/jpeg",
+  ".js": "application/javascript",
+  ".json": "application/json",
+  ".md": "text/markdown",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  "__default__": "text/plain"
 }
-constexpr dynamic_config::Key<ParseContentTypeMap> kContentTypeMap{};
+)"},
+};
 
 }  // namespace
 
 HttpHandlerStatic::HttpHandlerStatic(
     const components::ComponentConfig& config,
-    const components::ComponentContext& context)
+    const components::ComponentContext& context
+)
     : HttpHandlerBase(config, context),
       config_(context.FindComponent<components::DynamicConfig>().GetSource()),
-      storage_(context
-                   .FindComponent<components::FsCache>(
-                       config["fs-cache-component"].As<std::string>(
-                           "fs-cache-component"))
-                   .GetClient()) {}
+      storage_(
+          context.FindComponent<components::FsCache>(config["fs-cache-component"].As<std::string>("fs-cache-component"))
+              .GetClient()
+      ) {}
 
-std::string HttpHandlerStatic::HandleRequestThrow(
-    const http::HttpRequest& request, request::RequestContext&) const {
-  LOG_DEBUG() << "Handler: " << request.GetRequestPath();
-  const auto file = storage_.TryGetFile(request.GetRequestPath());
-  if (file) {
-    const auto config = config_.GetSnapshot();
-    request.GetHttpResponse().SetContentType(
-        config[kContentTypeMap][file->extension]);
-    return file->data;
-  }
-  request.GetResponse().SetStatusNotFound();
-  return "File not found";
+std::string HttpHandlerStatic::HandleRequestThrow(const http::HttpRequest& request, request::RequestContext&) const {
+    LOG_DEBUG() << "Handler: " << request.GetRequestPath();
+    const auto file = storage_.TryGetFile(request.GetRequestPath());
+    if (file) {
+        const auto config = config_.GetSnapshot();
+        request.GetHttpResponse().SetContentType(config[kContentTypeMap][file->extension]);
+        return file->data;
+    }
+    request.GetHttpResponse().SetStatusNotFound();
+    return "File not found";
 }
 
 yaml_config::Schema HttpHandlerStatic::GetStaticConfigSchema() {
-  return yaml_config::MergeSchemas<HttpHandlerBase>(R"(
+    return yaml_config::MergeSchemas<HttpHandlerBase>(R"(
 type: object
 description: |
     Handler that returns HTTP 200 if file exist

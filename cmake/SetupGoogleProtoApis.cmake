@@ -8,45 +8,31 @@ elseif (USERVER_GOOGLE_COMMON_PROTOS)
   set(api-common-protos_SOURCE_DIR ${USERVER_GOOGLE_COMMON_PROTOS})
 endif()
 
-if (NOT api-common-protos_SOURCE_DIR)
-  set(api-common-protos_SOURCE_DIR ${USERVER_ROOT_DIR}/third_party/api-common-protos)
-endif()
-
 if (NOT EXISTS ${api-common-protos_SOURCE_DIR})
-  include(FetchContent)
-
-  FetchContent_Declare(
-    api-common-protos_external_project
-    GIT_REPOSITORY https://github.com/googleapis/api-common-protos.git
-    TIMEOUT 10
-    GIT_TAG 1.50.0
-    SOURCE_DIR ${api-common-protos_SOURCE_DIR}
+  include(DownloadUsingCPM)
+  CPMAddPackage(
+      NAME api-common-protos
+      VERSION 1.50.0
+      GITHUB_REPOSITORY googleapis/api-common-protos
+      GIT_TAG 1.50.0
+      DOWNLOAD_ONLY YES
   )
-
-  FetchContent_GetProperties(api-common-protos_external_project)
-  if (NOT api-common-protos_external_project_POPULATED AND
-      # POPULATED check glitches with multiple build directories
-      NOT EXISTS ${api-common-protos_SOURCE_DIR})
-    message(STATUS "Downloading api-common-protos from remote")
-    FetchContent_Populate(api-common-protos_external_project)
-  endif()
 endif()
 
 if (NOT api-common-protos_SOURCE_DIR)
   message(FATAL_ERROR "Unable to get google common proto apis. It is required for userver-grpc build.")
 endif()
 
-include(GrpcTargets)
-file(GLOB_RECURSE SOURCES
-  ${api-common-protos_SOURCE_DIR}/*.proto)
+include(UserverGrpcTargets)
+file(GLOB SOURCES
+  ${api-common-protos_SOURCE_DIR}/google/api/*.proto
+  ${api-common-protos_SOURCE_DIR}/google/rpc/*.proto
+)
 
-generate_grpc_files(
-  PROTOS
-   ${SOURCES}
-  INCLUDE_DIRECTORIES
-    ${api-common-protos_SOURCE_DIR}
-  SOURCE_PATH
-    ${api-common-protos_SOURCE_DIR}
+userver_generate_grpc_files(
+  PROTOS ${SOURCES}
+  INCLUDE_DIRECTORIES ${api-common-protos_SOURCE_DIR}
+  SOURCE_PATH ${api-common-protos_SOURCE_DIR}
   GENERATED_INCLUDES include_paths
   CPP_FILES generated_sources
   CPP_USRV_FILES generated_usrv_sources
@@ -54,8 +40,14 @@ generate_grpc_files(
 
 add_library(userver-api-common-protos STATIC ${generated_sources})
 target_compile_options(userver-api-common-protos PUBLIC -Wno-unused-parameter)
-target_include_directories(userver-api-common-protos SYSTEM PUBLIC ${include_paths})
-target_link_libraries(userver-api-common-protos PUBLIC userver-core userver-grpc-deps)
+target_include_directories(userver-api-common-protos SYSTEM PUBLIC $<BUILD_INTERFACE:${include_paths}>)
+target_link_libraries(userver-api-common-protos PUBLIC userver-grpc-deps)
+
+_userver_directory_install(COMPONENT grpc
+  DIRECTORY ${include_paths}/google
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/userver/third_party
+  PATTERN "*.pb.h"
+)
 
 set(api-common-proto_LIBRARY userver-api-common-protos)
 set(api-common-proto_USRV_SOURCES ${generated_usrv_sources})

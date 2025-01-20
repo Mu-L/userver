@@ -10,12 +10,12 @@ import pytest
 
 class ServiceRunnerModule(pytest.Module):
     class FakeModule:
-        def __init__(self, fspath):
-            self.__file__ = fspath
+        def __init__(self, path):
+            self.__file__ = path
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._module = self.FakeModule(str(self.fspath))
+        self._module = self.FakeModule(path=str(self.path))
 
     @property
     def obj(self):
@@ -25,22 +25,23 @@ class ServiceRunnerModule(pytest.Module):
 class UserviceRunner:
     @pytest.hookimpl(tryfirst=True)
     def pytest_collection_modifyitems(self, session, config, items):
-        pathes = set()
+        paths = set()
 
-        # Is there servicetest choosen
+        # Is there servicetest chosen
         for item in items:
-            pathes.add(pathlib.Path(item.module.__file__).parent)
+            paths.add(pathlib.Path(item.module.__file__).parent)
             for marker in item.own_markers:
                 if marker.name == 'servicetest':
                     return
 
-        if not pathes:
+        if not paths:
             return
 
-        tests_root = min(pathes, key=lambda p: len(p.parts))
+        tests_root = min(paths, key=lambda p: len(p.parts))
 
         module = ServiceRunnerModule.from_parent(
-            parent=session, path=tests_root / '__service__',
+            parent=session,
+            path=pathlib.Path(tests_root).resolve(),
         )
         function = pytest.Function.from_parent(
             parent=module,
@@ -53,7 +54,9 @@ class UserviceRunner:
 
 @pytest.mark.servicetest
 def test_service_default(
-        service_client, service_baseurl, monitor_baseurl,
+    service_client,
+    service_baseurl,
+    monitor_baseurl,
 ) -> None:
     """
     This is default service runner testcase. Feel free to override it

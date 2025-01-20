@@ -4,7 +4,6 @@ import pytest
 
 import utils
 
-
 SELECT_URL = '/chaos/postgres?type=select'
 SELECT_SMALL_TIMEOUT_URL = '/chaos/postgres?type=select-small-timeout'
 
@@ -39,7 +38,7 @@ async def test_transaction_fine(service_client, gate, testpoint):
     assert hook4.times_called == 1
 
 
-TESTPOINT_NAMES = ('before_trx_begin', 'after_trx_begin', 'before_trx_commit')
+TESTPOINT_NAMES = ('after_trx_begin', 'before_trx_commit')
 
 
 @pytest.mark.parametrize('tp_name', TESTPOINT_NAMES)

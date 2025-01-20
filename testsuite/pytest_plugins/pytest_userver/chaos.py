@@ -1,13 +1,14 @@
+# pylint: disable=too-many-lines
 """
 Python module that provides testsuite support for
-chaos tests; see @ref md_en_userver_chaos_testing for an introduction.
+chaos tests; see
+@ref scripts/docs/en/userver/chaos_testing.md for an introduction.
 
 @ingroup userver_testsuite
 """
 
 import asyncio
 import dataclasses
-import errno
 import fcntl
 import logging
 import os
@@ -40,7 +41,7 @@ class GateRoute:
 # @cond
 
 # https://docs.python.org/3/library/socket.html#socket.socket.recv
-RECV_MAX_SIZE = 1024 * 1024 * 128
+RECV_MAX_SIZE = 4096
 MAX_DELAY = 60.0
 
 
@@ -51,7 +52,8 @@ Address = typing.Tuple[str, int]
 EvLoop = typing.Any
 Socket = socket.socket
 Interceptor = typing.Callable[
-    [EvLoop, Socket, Socket], typing.Coroutine[typing.Any, typing.Any, None],
+    [EvLoop, Socket, Socket],
+    typing.Coroutine[typing.Any, typing.Any, None],
 ]
 
 
@@ -64,37 +66,28 @@ class GateInterceptException(Exception):
 
 
 async def _yield() -> None:
-    _MIN_DELAY = 0.01
-    await asyncio.sleep(_MIN_DELAY)
+    # Minamal delay can be 0. This will be fast path for coroutine switching
+    # https://docs.python.org/3/library/asyncio-task.html#sleeping
+
+    min_delay = 0
+    await asyncio.sleep(min_delay)
 
 
 def _try_get_message(
-        recv_socket: Socket,
+    recv_socket: Socket,
+    flags: int,
 ) -> typing.Tuple[typing.Optional[bytes], typing.Optional[Address]]:
-
     try:
-        return recv_socket.recvfrom(RECV_MAX_SIZE, socket.MSG_PEEK)
-    except socket.error as e:
-        err = e.args[0]
-        if err in {errno.EAGAIN, errno.EWOULDBLOCK}:
-            return None, None
-        raise e
+        return recv_socket.recvfrom(RECV_MAX_SIZE, flags)
+    except (BlockingIOError, InterruptedError):
+        return None, None
 
 
-async def _wait_for_message_task(
-        recv_socket: Socket,
+async def _get_message_task(
+    recv_socket: Socket,
 ) -> typing.Tuple[bytes, Address]:
-    iteration = 0
-    _LOG_FREQUENCY = 100
     while True:
-        if not iteration % _LOG_FREQUENCY:
-            logger.debug(
-                f'Wait for message on socket fd={recv_socket.fileno()}. '
-                f'Iteration {iteration}',
-            )
-        iteration += 1
-
-        msg, addr = _try_get_message(recv_socket)
+        msg, addr = _try_get_message(recv_socket, 0)
         if msg:
             assert addr
             return msg, addr
@@ -102,26 +95,41 @@ async def _wait_for_message_task(
         await _yield()
 
 
-def _incomming_data_size(recv_socket: Socket) -> int:
-    msg, _ = _try_get_message(recv_socket)
+def _incoming_data_size(recv_socket: Socket) -> int:
+    msg, _ = _try_get_message(recv_socket, socket.MSG_PEEK)
     return len(msg) if msg else 0
 
 
 async def _intercept_ok(
-        loop: EvLoop, socket_from: Socket, socket_to: Socket,
+    loop: EvLoop,
+    socket_from: Socket,
+    socket_to: Socket,
 ) -> None:
     data = await loop.sock_recv(socket_from, RECV_MAX_SIZE)
     await loop.sock_sendall(socket_to, data)
 
 
 async def _intercept_noop(
-        loop: EvLoop, socket_from: Socket, socket_to: Socket,
+    loop: EvLoop,
+    socket_from: Socket,
+    socket_to: Socket,
 ) -> None:
     pass
 
 
+async def _intercept_drop(
+    loop: EvLoop,
+    socket_from: Socket,
+    socket_to: Socket,
+) -> None:
+    await loop.sock_recv(socket_from, RECV_MAX_SIZE)
+
+
 async def _intercept_delay(
-        delay: float, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+    delay: float,
+    loop: EvLoop,
+    socket_from: Socket,
+    socket_to: Socket,
 ) -> None:
     data = await loop.sock_recv(socket_from, RECV_MAX_SIZE)
     await asyncio.sleep(delay)
@@ -129,14 +137,18 @@ async def _intercept_delay(
 
 
 async def _intercept_close_on_data(
-        loop: EvLoop, socket_from: Socket, socket_to: Socket,
+    loop: EvLoop,
+    socket_from: Socket,
+    socket_to: Socket,
 ) -> None:
     await loop.sock_recv(socket_from, 1)
     raise GateInterceptException('Closing socket on data')
 
 
 async def _intercept_corrupt(
-        loop: EvLoop, socket_from: Socket, socket_to: Socket,
+    loop: EvLoop,
+    socket_from: Socket,
+    socket_to: Socket,
 ) -> None:
     data = await loop.sock_recv(socket_from, RECV_MAX_SIZE)
     await loop.sock_sendall(socket_to, bytearray([not x for x in data]))
@@ -161,7 +173,10 @@ class _InterceptBpsLimit:
                 self._bytes_left = self._bytes_per_second
 
     async def __call__(
-            self, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+        self,
+        loop: EvLoop,
+        socket_from: Socket,
+        socket_to: Socket,
     ) -> None:
         self._update_limit()
 
@@ -195,23 +210,31 @@ class _InterceptTimeLimit:
             raise GateInterceptException('Socket hits the time limit')
 
     async def __call__(
-            self, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+        self,
+        loop: EvLoop,
+        socket_from: Socket,
+        socket_to: Socket,
     ) -> None:
         self.raise_if_timed_out(socket_from)
         await _intercept_ok(loop, socket_from, socket_to)
 
 
 class _InterceptSmallerParts:
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, sleep_per_packet: float):
         assert max_size > 0
         self._max_size = max_size
+        self._sleep_per_packet = sleep_per_packet
 
     async def __call__(
-            self, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+        self,
+        loop: EvLoop,
+        socket_from: Socket,
+        socket_to: Socket,
     ) -> None:
-        incomming_size = _incomming_data_size(socket_from)
-        chunk_size = min(incomming_size, self._max_size)
+        incoming_size = _incoming_data_size(socket_from)
+        chunk_size = min(incoming_size, self._max_size)
         data = await loop.sock_recv(socket_from, chunk_size)
+        await asyncio.sleep(self._sleep_per_packet)
         await loop.sock_sendall(socket_to, data)
 
 
@@ -222,7 +245,10 @@ class _InterceptConcatPackets:
         self._expire_at: typing.Optional[float] = None
 
     async def __call__(
-            self, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+        self,
+        loop: EvLoop,
+        socket_from: Socket,
+        socket_to: Socket,
     ) -> None:
         if self._expire_at is None:
             self._expire_at = time.monotonic() + MAX_DELAY
@@ -236,8 +262,8 @@ class _InterceptConcatPackets:
             )
             sys.exit(2)
 
-        incomming_size = _incomming_data_size(socket_from)
-        if incomming_size >= self._packet_size:
+        incoming_size = _incoming_data_size(socket_from)
+        if incoming_size >= self._packet_size:
             data = await loop.sock_recv(socket_from, RECV_MAX_SIZE)
             await loop.sock_sendall(socket_to, data)
             self._expire_at = None
@@ -251,7 +277,10 @@ class _InterceptBytesLimit:
         self._gate = gate
 
     async def __call__(
-            self, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+        self,
+        loop: EvLoop,
+        socket_from: Socket,
+        socket_to: Socket,
     ) -> None:
         data = await loop.sock_recv(socket_from, RECV_MAX_SIZE)
         if self._bytes_remain <= len(data):
@@ -271,7 +300,10 @@ class _InterceptSubstitute:
         self._encoding = encoding
 
     async def __call__(
-            self, loop: EvLoop, socket_from: Socket, socket_to: Socket,
+        self,
+        loop: EvLoop,
+        socket_from: Socket,
+        socket_to: Socket,
     ) -> None:
         data = await loop.sock_recv(socket_from, RECV_MAX_SIZE)
         try:
@@ -295,15 +327,67 @@ async def _cancel_and_join(task: typing.Optional[asyncio.Task]) -> None:
         logger.error('Exception in _cancel_and_join: %s', exc)
 
 
+def _make_socket_nonblocking(sock: Socket) -> None:
+    sock.setblocking(False)
+    if sock.type == socket.SOCK_STREAM:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    fcntl.fcntl(sock, fcntl.F_SETFL, os.O_NONBLOCK)
+
+
+class _UdpDemuxSocketMock:
+    """
+    Emulates a point-to-point connection over UDP socket
+    with a non-blocking socket interface
+    """
+
+    def __init__(self, sock: Socket, peer_address: Address):
+        self._sock: Socket = sock
+        self._peeraddr: Address = peer_address
+
+        sockpair = socket.socketpair(type=socket.SOCK_DGRAM)
+        self._demux_in: Socket = sockpair[0]
+        self._demux_out: Socket = sockpair[1]
+        _make_socket_nonblocking(self._demux_in)
+        _make_socket_nonblocking(self._demux_out)
+        self._is_active: bool = True
+
+    @property
+    def peer_address(self):
+        return self._peeraddr
+
+    async def push(self, loop: EvLoop, data: bytes):
+        return await loop.sock_sendall(self._demux_in, data)
+
+    def is_active(self):
+        return self._is_active
+
+    def close(self):
+        self._is_active = False
+        self._demux_out.close()
+        self._demux_in.close()
+
+    def recvfrom(self, bufsize: int, flags: int = 0):
+        return self._demux_out.recvfrom(bufsize, flags)
+
+    def recv(self, bufsize: int, flags: int = 0):
+        return self._demux_out.recv(bufsize, flags)
+
+    def fileno(self):
+        return self._demux_out.fileno()
+
+    def send(self, data: bytes):
+        return self._sock.sendto(data, self._peeraddr)
+
+
 class _SocketsPaired:
     def __init__(
-            self,
-            proxy_name: str,
-            loop: EvLoop,
-            client: socket.socket,
-            server: socket.socket,
-            to_server_intercept: Interceptor,
-            to_client_intercept: Interceptor,
+        self,
+        proxy_name: str,
+        loop: EvLoop,
+        client: typing.Union[socket.socket, _UdpDemuxSocketMock],
+        server: socket.socket,
+        to_server_intercept: Interceptor,
+        to_client_intercept: Interceptor,
     ) -> None:
         self._proxy_name = proxy_name
         self._loop = loop
@@ -338,7 +422,7 @@ class _SocketsPaired:
                 # To avoid long awaiting on sock_recv in an outdated
                 # interceptor we wait for data before grabbing and applying
                 # the interceptor.
-                if not _incomming_data_size(socket_from):
+                if not _incoming_data_size(socket_from):
                     await _yield()
                     continue
 
@@ -391,18 +475,13 @@ class _SocketsPaired:
             await _cancel_and_join(task)
 
     def is_active(self) -> bool:
-        return (
-            not self._task_to_client.done() or not self._task_to_server.done()
-        )
+        return not self._task_to_client.done() or not self._task_to_server.done()
 
     def info(self) -> str:
         if not self.is_active():
             return '<inactive>'
 
-        return (
-            f'client fd={self._client.fileno()} <=> '
-            f'server fd={self._server.fileno()}'
-        )
+        return f'client fd={self._client.fileno()} <=> ' f'server fd={self._server.fileno()}'
 
 
 # @endcond
@@ -412,7 +491,7 @@ class BaseGate:
     """
     This base class maintain endpoints of two types:
 
-    Server-side endpoints to recieve messages from clients. Address of this
+    Server-side endpoints to receive messages from clients. Address of this
     endpoint is described by (host_for_client, port_for_client).
 
     Client-side endpoints to forward messages to server. Server must listen on
@@ -427,13 +506,10 @@ class BaseGate:
 
     @ingroup userver_testsuite
 
-    @see @ref md_en_userver_chaos_testing
+    @see @ref scripts/docs/en/userver/chaos_testing.md
     """
 
-    _NOT_IMPLEMENTED_MESSAGE = (
-        'Do not use BaseGate itself, use one of '
-        'specializations TcpGate or UdpGate'
-    )
+    _NOT_IMPLEMENTED_MESSAGE = 'Do not use BaseGate itself, use one of ' 'specializations TcpGate or UdpGate'
 
     def __init__(self, route: GateRoute, loop: EvLoop) -> None:
         self._route = route
@@ -444,8 +520,6 @@ class BaseGate:
 
         self._accept_sockets: typing.List[socket.socket] = []
         self._accept_tasks: typing.List[asyncio.Task[None]] = []
-
-        self._connected_event = asyncio.Event()
 
         self._sockets: typing.Set[_SocketsPaired] = set()
 
@@ -460,7 +534,7 @@ class BaseGate:
         raise NotImplementedError(self._NOT_IMPLEMENTED_MESSAGE)
 
     def start(self):
-        """ Open the socket and start accepting tasks """
+        """Open the socket and start accepting tasks"""
         if self._accept_sockets:
             return
 
@@ -484,7 +558,7 @@ class BaseGate:
         BaseGate.start_accepting(self)
 
     def start_accepting(self) -> None:
-        """ Start accepting tasks """
+        """Start accepting tasks"""
         assert self._accept_sockets
         if not all(tsk.done() for tsk in self._accept_tasks):
             return
@@ -513,21 +587,22 @@ class BaseGate:
         self.to_server_pass()
         self.to_client_pass()
 
-        for sock in self._accept_sockets:
-            sock.close()
-
         await BaseGate.stop_accepting(self)
         logger.info('Before close() %s', self.info())
         await self.sockets_close()
         assert not self._sockets
 
+        for sock in self._accept_sockets:
+            sock.close()
         self._accept_sockets.clear()
         logger.info('Stopped. %s', self.info())
 
     async def sockets_close(
-            self, *, count: typing.Optional[int] = None,
+        self,
+        *,
+        count: typing.Optional[int] = None,
     ) -> None:
-        """ Close all the connection going through the gate """
+        """Close all the connection going through the gate"""
         for x in list(self._sockets)[0:count]:
             await x.shutdown()
         self._collect_garbage()
@@ -539,19 +614,15 @@ class BaseGate:
         This function allows to use 0 in GateRoute.port_for_client and retrieve
         the actual port and host.
         """
-        assert self._route.port_for_client != 0, (
-            'Gate was not started and the port_for_client is still 0',
-        )
+        assert self._route.port_for_client != 0, ('Gate was not started and the port_for_client is still 0',)
         return (self._route.host_for_client, self._route.port_for_client)
 
     def info(self) -> str:
-        """ Print info on open sockets """
+        """Print info on open sockets"""
         if not self._sockets:
             return f'"{self._route.name}" no active sockets'
 
-        return f'"{self._route.name}" active sockets:\n\t' + '\n\t'.join(
-            x.info() for x in self._sockets
-        )
+        return f'"{self._route.name}" active sockets:\n\t' + '\n\t'.join(x.info() for x in self._sockets)
 
     def _collect_garbage(self) -> None:
         self._sockets = {x for x in self._sockets if x.is_active()}
@@ -579,119 +650,155 @@ class BaseGate:
             x.set_to_client_interceptor(self._to_client_intercept)
 
     def to_server_pass(self) -> None:
-        """ Pass data as is """
-        logging.debug('to_server_pass')
+        """Pass data as is"""
+        logging.trace('to_server_pass')
         self.set_to_server_interceptor(_intercept_ok)
 
     def to_client_pass(self) -> None:
-        """ Pass data as is """
-        logging.debug('to_client_pass')
+        """Pass data as is"""
+        logging.trace('to_client_pass')
         self.set_to_client_interceptor(_intercept_ok)
 
     def to_server_noop(self) -> None:
-        """ Do not read data, causing client to keep multiple data """
-        logging.debug('to_server_noop')
+        """Do not read data, causing client to keep multiple data"""
+        logging.trace('to_server_noop')
         self.set_to_server_interceptor(_intercept_noop)
 
     def to_client_noop(self) -> None:
-        """ Do not read data, causing server to keep multiple data """
-        logging.debug('to_client_noop')
+        """Do not read data, causing server to keep multiple data"""
+        logging.trace('to_client_noop')
         self.set_to_client_interceptor(_intercept_noop)
 
+    def to_server_drop(self) -> None:
+        """Read and discard data"""
+        logging.trace('to_server_drop')
+        self.set_to_server_interceptor(_intercept_drop)
+
+    def to_client_drop(self) -> None:
+        """Read and discard data"""
+        logging.trace('to_client_drop')
+        self.set_to_client_interceptor(_intercept_drop)
+
     def to_server_delay(self, delay: float) -> None:
-        """ Delay data transmission """
-        logging.debug('to_server_delay, delay: %s', delay)
+        """Delay data transmission"""
+        logging.trace('to_server_delay, delay: %s', delay)
 
         async def _intercept_delay_bound(
-                loop: EvLoop, socket_from: Socket, socket_to: Socket,
+            loop: EvLoop,
+            socket_from: Socket,
+            socket_to: Socket,
         ) -> None:
             await _intercept_delay(delay, loop, socket_from, socket_to)
 
         self.set_to_server_interceptor(_intercept_delay_bound)
 
     def to_client_delay(self, delay: float) -> None:
-        """ Delay data transmission """
-        logging.debug('to_client_delay, delay: %s', delay)
+        """Delay data transmission"""
+        logging.trace('to_client_delay, delay: %s', delay)
 
         async def _intercept_delay_bound(
-                loop: EvLoop, socket_from: Socket, socket_to: Socket,
+            loop: EvLoop,
+            socket_from: Socket,
+            socket_to: Socket,
         ) -> None:
             await _intercept_delay(delay, loop, socket_from, socket_to)
 
         self.set_to_client_interceptor(_intercept_delay_bound)
 
     def to_server_close_on_data(self) -> None:
-        """ Close on first bytes of data from client """
-        logging.debug('to_server_close_on_data')
+        """Close on first bytes of data from client"""
+        logging.trace('to_server_close_on_data')
         self.set_to_server_interceptor(_intercept_close_on_data)
 
     def to_client_close_on_data(self) -> None:
-        """ Close on first bytes of data from server """
-        logging.debug('to_client_close_on_data')
+        """Close on first bytes of data from server"""
+        logging.trace('to_client_close_on_data')
         self.set_to_client_interceptor(_intercept_close_on_data)
 
     def to_server_corrupt_data(self) -> None:
-        """ Corrupt data received from client """
-        logging.debug('to_server_corrupt_data')
+        """Corrupt data received from client"""
+        logging.trace('to_server_corrupt_data')
         self.set_to_server_interceptor(_intercept_corrupt)
 
     def to_client_corrupt_data(self) -> None:
-        """ Corrupt data received from server """
-        logging.debug('to_client_corrupt_data')
+        """Corrupt data received from server"""
+        logging.trace('to_client_corrupt_data')
         self.set_to_client_interceptor(_intercept_corrupt)
 
     def to_server_limit_bps(self, bytes_per_second: float) -> None:
-        """ Limit bytes per second transmission by network from client """
-        logging.debug(
-            'to_server_limit_bps, bytes_per_second: %s', bytes_per_second,
+        """Limit bytes per second transmission by network from client"""
+        logging.trace(
+            'to_server_limit_bps, bytes_per_second: %s',
+            bytes_per_second,
         )
         self.set_to_server_interceptor(_InterceptBpsLimit(bytes_per_second))
 
     def to_client_limit_bps(self, bytes_per_second: float) -> None:
-        """ Limit bytes per second transmission by network from server """
-        logging.debug(
-            'to_client_limit_bps, bytes_per_second: %s', bytes_per_second,
+        """Limit bytes per second transmission by network from server"""
+        logging.trace(
+            'to_client_limit_bps, bytes_per_second: %s',
+            bytes_per_second,
         )
         self.set_to_client_interceptor(_InterceptBpsLimit(bytes_per_second))
 
     def to_server_limit_time(self, timeout: float, jitter: float) -> None:
-        """ Limit connection lifetime on receive of first bytes from client """
-        logging.debug(
-            'to_server_limit_time, timeout: %s, jitter: %s', timeout, jitter,
+        """Limit connection lifetime on receive of first bytes from client"""
+        logging.trace(
+            'to_server_limit_time, timeout: %s, jitter: %s',
+            timeout,
+            jitter,
         )
         self.set_to_server_interceptor(_InterceptTimeLimit(timeout, jitter))
 
     def to_client_limit_time(self, timeout: float, jitter: float) -> None:
-        """ Limit connection lifetime on receive of first bytes from server """
-        logging.debug(
-            'to_client_limit_time, timeout: %s, jitter: %s', timeout, jitter,
+        """Limit connection lifetime on receive of first bytes from server"""
+        logging.trace(
+            'to_client_limit_time, timeout: %s, jitter: %s',
+            timeout,
+            jitter,
         )
         self.set_to_client_interceptor(_InterceptTimeLimit(timeout, jitter))
 
-    def to_server_smaller_parts(self, max_size: int) -> None:
+    def to_server_smaller_parts(
+        self,
+        max_size: int,
+        *,
+        sleep_per_packet: float = 0,
+    ) -> None:
         """
         Pass data to server in smaller parts
 
         @param max_size Max packet size to send to server
+        @param sleep_per_packet Optional sleep interval per packet, seconds
         """
-        logging.debug('to_server_smaller_parts, max_size: %s', max_size)
-        self.set_to_server_interceptor(_InterceptSmallerParts(max_size))
+        logging.trace('to_server_smaller_parts, max_size: %s', max_size)
+        self.set_to_server_interceptor(
+            _InterceptSmallerParts(max_size, sleep_per_packet),
+        )
 
-    def to_client_smaller_parts(self, max_size: int) -> None:
+    def to_client_smaller_parts(
+        self,
+        max_size: int,
+        *,
+        sleep_per_packet: float = 0,
+    ) -> None:
         """
         Pass data to client in smaller parts
 
         @param max_size Max packet size to send to client
+        @param sleep_per_packet Optional sleep interval per packet, seconds
         """
-        logging.debug('to_client_smaller_parts, max_size: %s', max_size)
-        self.set_to_client_interceptor(_InterceptSmallerParts(max_size))
+        logging.trace('to_client_smaller_parts, max_size: %s', max_size)
+        self.set_to_client_interceptor(
+            _InterceptSmallerParts(max_size, sleep_per_packet),
+        )
 
     def to_server_concat_packets(self, packet_size: int) -> None:
         """
         Pass data in bigger parts
         @param packet_size minimal size of the resulting packet
         """
-        logging.debug('to_server_concat_packets, packet_size: %s', packet_size)
+        logging.trace('to_server_concat_packets, packet_size: %s', packet_size)
         self.set_to_server_interceptor(_InterceptConcatPackets(packet_size))
 
     def to_client_concat_packets(self, packet_size: int) -> None:
@@ -699,30 +806,34 @@ class BaseGate:
         Pass data in bigger parts
         @param packet_size minimal size of the resulting packet
         """
-        logging.debug('to_client_concat_packets, packet_size: %s', packet_size)
+        logging.trace('to_client_concat_packets, packet_size: %s', packet_size)
         self.set_to_client_interceptor(_InterceptConcatPackets(packet_size))
 
     def to_server_limit_bytes(self, bytes_limit: int) -> None:
-        """ Drop all connections each `bytes_limit` of data sent by network """
-        logging.debug('to_server_limit_bytes, bytes_limit: %s', bytes_limit)
+        """Drop all connections each `bytes_limit` of data sent by network"""
+        logging.trace('to_server_limit_bytes, bytes_limit: %s', bytes_limit)
         self.set_to_server_interceptor(_InterceptBytesLimit(bytes_limit, self))
 
     def to_client_limit_bytes(self, bytes_limit: int) -> None:
-        """ Drop all connections each `bytes_limit` of data sent by network """
-        logging.debug('to_client_limit_bytes, bytes_limit: %s', bytes_limit)
+        """Drop all connections each `bytes_limit` of data sent by network"""
+        logging.trace('to_client_limit_bytes, bytes_limit: %s', bytes_limit)
         self.set_to_client_interceptor(_InterceptBytesLimit(bytes_limit, self))
 
     def to_server_substitute(self, pattern: str, repl: str) -> None:
-        """ Apply regex substitution to data from client """
-        logging.debug(
-            'to_server_substitute, pattern: %s, repl: %s', pattern, repl,
+        """Apply regex substitution to data from client"""
+        logging.trace(
+            'to_server_substitute, pattern: %s, repl: %s',
+            pattern,
+            repl,
         )
         self.set_to_server_interceptor(_InterceptSubstitute(pattern, repl))
 
     def to_client_substitute(self, pattern: str, repl: str) -> None:
-        """ Apply regex substitution to data from server """
-        logging.debug(
-            'to_client_substitute, pattern: %s, repl: %s', pattern, repl,
+        """Apply regex substitution to data from server"""
+        logging.trace(
+            'to_client_substitute, pattern: %s, repl: %s',
+            pattern,
+            repl,
         )
         self.set_to_client_interceptor(_InterceptSubstitute(pattern, repl))
 
@@ -735,10 +846,11 @@ class TcpGate(BaseGate):
 
     @ingroup userver_testsuite
 
-    @see @ref md_en_userver_chaos_testing
+    @see @ref scripts/docs/en/userver/chaos_testing.md
     """
 
     def __init__(self, route: GateRoute, loop: EvLoop) -> None:
+        self._connected_event = asyncio.Event()
         BaseGate.__init__(self, route, loop)
 
     def connections_count(self) -> int:
@@ -768,22 +880,26 @@ class TcpGate(BaseGate):
         while self.connections_count() < count:
             time_left = deadline - time.monotonic()
             await asyncio.wait_for(
-                self._connected_event.wait(), timeout=time_left,
+                self._connected_event.wait(),
+                timeout=time_left,
             )
             self._connected_event.clear()
 
     def _create_accepting_sockets(self) -> typing.List[Socket]:
         res: typing.List[Socket] = []
         for addr in socket.getaddrinfo(
-                self._route.host_for_client,
-                self._route.port_for_client,
-                type=socket.SOCK_STREAM,
+            self._route.host_for_client,
+            self._route.port_for_client,
+            type=socket.SOCK_STREAM,
         ):
             sock = Socket(addr[0], addr[1])
+            _make_socket_nonblocking(sock)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(addr[4])
             sock.listen()
-            logger.debug(f'Accepting connections on {sock.getsockname()}')
+            logger.debug(
+                f'Accepting connections on {sock.getsockname()}, ' f'fd={sock.fileno()}',
+            )
             res.append(sock)
 
         return res
@@ -797,19 +913,18 @@ class TcpGate(BaseGate):
         for addr in addrs:
             server = Socket(addr[0], addr[1])
             try:
+                _make_socket_nonblocking(server)
                 await self._loop.sock_connect(server, addr[4])
-                server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                fcntl.fcntl(server, fcntl.F_SETFL, os.O_NONBLOCK)
-                logging.debug('Connected to %s', addr[4])
+                logging.trace('Connected to %s', addr[4])
                 return server
             except Exception as exc:  # pylint: disable=broad-except
+                server.close()
                 logging.warning('Could not connect to %s: %s', addr[4], exc)
 
     async def _do_accept(self, accept_sock: Socket) -> None:
         while accept_sock:
             client, _ = await self._loop.sock_accept(accept_sock)
-            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            fcntl.fcntl(client, fcntl.F_SETFL, os.O_NONBLOCK)
+            _make_socket_nonblocking(client)
 
             server = await self._connect_to_server()
             if server:
@@ -832,19 +947,17 @@ class TcpGate(BaseGate):
 
 class UdpGate(BaseGate):
     """
-    Implements UDP chaos-proxy logic such as waiting for first
-    message and setting up sockets for forwarding messages between
-    udp-client and udp-server
+    Implements UDP chaos-proxy logic such as demuxing incoming datagrams
+    from different clients.
+    Separate connections to server are made for each new client.
 
     @ingroup userver_testsuite
 
-    @see @ref md_en_userver_chaos_testing
+    @see @ref scripts/docs/en/userver/chaos_testing.md
     """
 
-    _NOT_IMPLEMENTED_IN_UDP = 'This method is not allowed in UDP gate'
-
     def __init__(self, route: GateRoute, loop: EvLoop):
-        self._client_addr: typing.Optional[Address] = None
+        self._clients: typing.Set[_UdpDemuxSocketMock] = set()
         BaseGate.__init__(self, route, loop)
 
     def is_connected(self) -> bool:
@@ -857,12 +970,12 @@ class UdpGate(BaseGate):
     def _create_accepting_sockets(self) -> typing.List[Socket]:
         res: typing.List[Socket] = []
         for addr in socket.getaddrinfo(
-                self._route.host_for_client,
-                self._route.port_for_client,
-                type=socket.SOCK_DGRAM,
+            self._route.host_for_client,
+            self._route.port_for_client,
+            type=socket.SOCK_DGRAM,
         ):
             sock = socket.socket(addr[0], addr[1])
-            fcntl.fcntl(sock, fcntl.F_SETFL, os.O_NONBLOCK)
+            _make_socket_nonblocking(sock)
             sock.bind(addr[4])
             logger.debug(f'Accepting connections on {sock.getsockname()}')
             res.append(sock)
@@ -878,65 +991,68 @@ class UdpGate(BaseGate):
         for addr in addrs:
             server = Socket(addr[0], addr[1])
             try:
+                _make_socket_nonblocking(server)
                 await self._loop.sock_connect(server, addr[4])
-                fcntl.fcntl(server, fcntl.F_SETFL, os.O_NONBLOCK)
-                logging.debug('Connected to %s', addr[4])
+                logging.trace('Connected to %s', addr[4])
                 return server
             except Exception as exc:  # pylint: disable=broad-except
                 logging.warning('Could not connect to %s: %s', addr[4], exc)
 
+    def _collect_garbage(self) -> None:
+        super()._collect_garbage()
+        self._clients = {c for c in self._clients if c.is_active()}
+
     async def _do_accept(self, accept_sock: Socket):
-        if not accept_sock:
-            return
+        while True:
+            data, addr = await _get_message_task(accept_sock)
 
-        _, addr = await _wait_for_message_task(accept_sock)
+            client: typing.Optional[_UdpDemuxSocketMock] = None
+            for known_clients in self._clients:
+                if addr == known_clients.peer_address:
+                    client = known_clients
+                    break
 
-        self._client_addr = addr
-        try:
-            await self._loop.sock_connect(accept_sock, addr)
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.warning('Could not connect to %s: %s', addr, exc)
+            if client is None:
+                server = await self._connect_to_server()
+                if not server:
+                    accept_sock.close()
+                    break
 
-        server = await self._connect_to_server()
-        if server:
-            self._sockets.add(
-                _SocketsPaired(
-                    self._route.name,
-                    self._loop,
-                    accept_sock,
-                    server,
-                    self._to_server_intercept,
-                    self._to_client_intercept,
-                ),
-            )
-            self._connected_event.set()
-        else:
-            accept_sock.close()
+                client = _UdpDemuxSocketMock(accept_sock, addr)
+                self._clients.add(client)
 
-        self._collect_garbage()
+                self._sockets.add(
+                    _SocketsPaired(
+                        self._route.name,
+                        self._loop,
+                        client,
+                        server,
+                        self._to_server_intercept,
+                        self._to_client_intercept,
+                    ),
+                )
 
-    def start_accepting(self) -> None:
-        raise NotImplementedError(
-            'Since UdpGate can only have one connection, you cannot start or '
-            'stop accepting tasks manually. Use start() and stop() mehtods to '
-            'stop data transfering',
-        )
-
-    async def stop_accepting(self) -> None:
-        raise NotImplementedError(
-            'Since UdpGate can only have one connection, you cannot start or '
-            'stop accepting tasks manually. Use start() and stop() mehtods to '
-            'stop data transfering',
-        )
+            await client.push(self._loop, data)
+            self._collect_garbage()
 
     def to_server_concat_packets(self, packet_size: int) -> None:
-        raise NotImplementedError('Udp packets cannot be concatinated')
+        raise NotImplementedError('Udp packets cannot be concatenated')
 
     def to_client_concat_packets(self, packet_size: int) -> None:
-        raise NotImplementedError('Udp packets cannot be concatinated')
+        raise NotImplementedError('Udp packets cannot be concatenated')
 
-    def to_server_smaller_parts(self, max_size: int) -> None:
-        raise NotImplementedError('Udp packets cannot be splited')
+    def to_server_smaller_parts(
+        self,
+        max_size: int,
+        *,
+        sleep_per_packet: float = 0,
+    ) -> None:
+        raise NotImplementedError('Udp packets cannot be split')
 
-    def to_client_smaller_parts(self, max_size: int) -> None:
-        raise NotImplementedError('Udp packets cannot be splited')
+    def to_client_smaller_parts(
+        self,
+        max_size: int,
+        *,
+        sleep_per_packet: float = 0,
+    ) -> None:
+        raise NotImplementedError('Udp packets cannot be split')

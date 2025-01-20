@@ -1,37 +1,43 @@
 import re
-import typing
-
 
 SERVICE_COMMANDS = ('sentinel', 'cluster', 'info', 'ping')
 
 
-def _normalize_metrics(metrics: str) -> typing.Set[str]:
-    result = set()
+def _is_redis_metrics(line: str) -> bool:
+    # skip metrics related to service commands
+    # since we cannot force them to appear
+    if (
+        'redis' not in line
+        or any(('redis_command=' + cmd) in line for cmd in SERVICE_COMMANDS)
+        or 'redis_instance_type=slaves' in line
+    ):
+        return False
+    return True
+
+
+def _normalize_metrics(metrics: str) -> str:
+    result = []
     for line in metrics.splitlines():
-        # skip metrics unrelated to redis
-        if 'redis' not in line:
+        line = line.strip()
+        if line.startswith('#') or not line:
             continue
 
-        # skip metrics related to service commands
-        # since we cannot force them to appear
-        if any(('redis_command=' + cmd) in line for cmd in SERVICE_COMMANDS):
+        if not _is_redis_metrics(line):
             continue
 
-        # TODO: make the metrics less flapping:
-        if 'redis_instance_type=slaves' in line:
-            continue
+        left, _ = line.rsplit('\t', 1)
 
-        left, _, _ = line.rsplit(' ', 2)
-
-        left = re.sub('localhost_\\d+', 'localhost_00000', left)
+        left = re.sub('localhost:\\d+', '127.0.0.1:00000', left + '\t' + '0')
+        left = re.sub('127.0.0.1:\\d+', '127.0.0.1:00000', left)
+        left = re.sub('::1:\\d+', '127.0.0.1:00000', left)
         left = re.sub(
-            'redis_instance=[\\d_a-z.]+',
-            'redis_instance=localhost_00001',
+            '[a-f0-9]*:[a-f0-9]*:[a-f0-9]*:[a-f0-9]*:[a-f0-9]*:[a-f0-9]*',
+            '127.0.0.1:00000',
             left,
         )
-        result.add(left + ' ' + '0')
-
-    return result
+        result.append(left)
+    result.sort()
+    return '\n'.join(result) + '\n'
 
 
 async def test_metrics_smoke(service_client, monitor_client):
@@ -58,7 +64,8 @@ async def test_metrics(service_client, monitor_client, load, mocked_time):
     await service_client.invalidate_caches()
 
     ethalon = _normalize_metrics(load('metrics_values.txt'))
+    assert ethalon
     all_metrics = _normalize_metrics(
-        await monitor_client.metrics_raw(output_format='graphite'),
+        await monitor_client.metrics_raw(output_format='pretty'),
     )
     assert all_metrics == ethalon

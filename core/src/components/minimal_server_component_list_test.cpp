@@ -1,67 +1,37 @@
 #include <userver/components/minimal_server_component_list.hpp>
 
 #include <fmt/format.h>
+#include <gmock/gmock.h>
 
+#include <userver/compiler/demangle.hpp>
+#include <userver/components/component.hpp>
+#include <userver/components/component_base.hpp>
+#include <userver/components/manager_controller_component.hpp>
 #include <userver/components/run.hpp>
+#include <userver/engine/sleep.hpp>
+#include <userver/formats/json/exception.hpp>
 #include <userver/fs/blocking/read.hpp>
 #include <userver/fs/blocking/temp_directory.hpp>  // for fs::blocking::TempDirectory
-#include <userver/fs/blocking/write.hpp>  // for fs::blocking::RewriteFileContents
+#include <userver/fs/blocking/write.hpp>           // for fs::blocking::RewriteFileContents
+#include <userver/logging/component.hpp>
+#include <userver/utils/async.hpp>
 
 #include <components/component_list_test.hpp>
+#include <userver/internal/net/net_listener.hpp>
 #include <userver/utest/utest.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
 namespace {
 
-constexpr std::string_view kRuntimeConfigMissingParam = R"~({
-  "USERVER_TASK_PROCESSOR_PROFILER_DEBUG": {},
-  "USERVER_LOG_REQUEST": true,
-  "USERVER_CHECK_AUTH_IN_HANDLERS": false,
-  "USERVER_HTTP_PROXY": "",
-  "USERVER_CANCEL_HANDLE_REQUEST_BY_DEADLINE": false,
-  "USERVER_NO_LOG_SPANS":{"names":[], "prefixes":[]},
-  "USERVER_TASK_PROCESSOR_QOS": {
-    "default-service": {
-      "default-task-processor": {
-        "wait_queue_overload": {
-          "action": "ignore",
-          "length_limit": 5000,
-          "time_limit_us": 3000
-        }
-      }
-    }
-  },
-  "USERVER_CACHES": {},
-  "USERVER_RPS_CCONTROL_ACTIVATED_FACTOR_METRIC": 5,
-  "USERVER_LRU_CACHES": {},
-  "USERVER_DUMPS": {},
-  "USERVER_HANDLER_STREAM_API_ENABLED": false,
-  "HTTP_CLIENT_CONNECTION_POOL_SIZE": 1000,
-  "HTTP_CLIENT_CONNECT_THROTTLE": {
-    "max-size": 100,
-    "token-update-interval-ms": 0
-  },
-  "HTTP_CLIENT_ENFORCE_TASK_DEADLINE": {
-    "cancel-request": false,
-    "update-timeout": false
-  },
-  "USERVER_RPS_CCONTROL_ENABLED": true,
-  "USERVER_RPS_CCONTROL": {
-    "down-level": 8,
-    "down-rate-percent": 1,
-    "load-limit-crit-percent": 50,
-    "load-limit-percent": 0,
-    "min-limit": 2,
-    "no-limit-seconds": 300,
-    "overload-off-seconds": 8,
-    "overload-on-seconds": 8,
-    "up-level": 2,
-    "up-rate-percent": 1
-  },
-  "USERVER_RPS_CCONTROL_CUSTOM_STATUS": {},
-  "SAMPLE_INTEGER_FROM_RUNTIME_CONFIG": 42
-})~";
+std::uint16_t FindFreePort() {
+    std::uint16_t result{};
+    engine::RunStandalone([&result] {
+        const internal::net::TcpListener listener{};
+        result = listener.Port();
+    });
+    return result;
+}
 
 constexpr std::string_view kStaticConfig = R"(
 components_manager:
@@ -75,10 +45,8 @@ components_manager:
 # yaml
   task_processors:
     fs-task-processor:
-      thread_name: fs-worker
       worker_threads: 2
     main-task-processor:
-      thread_name: main-worker
       worker_threads: 4
       task-trace:
         every: 1
@@ -95,127 +63,151 @@ components_manager:
           level#fallback: info
 # /// [Sample task-switch tracing]
         default:
-          file_path: '@stderr'
+          file_path: $default-logger-path
+          file_path#fallback: '@null'
           level: warning
-    tracer:
-        service-name: config-service
     dynamic-config:
-      fs-cache-path: $runtime_config_path
-      fs-task-processor: main-task-processor
-    dynamic-config-fallbacks:
-        fallback-path: $runtime_config_path
+      defaults: $dynamic-config-default-overrides
+      defaults#fallback: {}
     server:
       listener:
-          port: 8087
+          port: $server-port
           task_processor: main-task-processor
-    statistics-storage: # Nothing
-    auth-checker-settings: # Nothing
-    manager-controller:  # Nothing
 config_vars: )";
 
 class ServerMinimalComponentList : public ComponentList {
- protected:
-  const std::string& GetTempRoot() const { return temp_root_.GetPath(); }
+protected:
+    const std::string& GetTempRoot() const { return temp_root_.GetPath(); }
 
-  std::string GetRuntimeConfigPath() const {
-    return temp_root_.GetPath() + "/runtime_config.json";
-  }
+    std::string GetConfigVarsPath() const { return temp_root_.GetPath() + "/config_vars.yaml"; }
 
-  std::string GetConfigVarsPath() const {
-    return temp_root_.GetPath() + "/config_vars.json";
-  }
+    const std::string& GetStaticConfig() const { return static_config_; }
 
-  const std::string& GetStaticConfig() const { return static_config_; }
+    std::uint16_t GetServerPort() const { return server_port_; }
 
- private:
-  fs::blocking::TempDirectory temp_root_ =
-      fs::blocking::TempDirectory::Create();
-  std::string static_config_ = std::string{kStaticConfig} + GetConfigVarsPath();
+private:
+    fs::blocking::TempDirectory temp_root_ = fs::blocking::TempDirectory::Create();
+    std::uint16_t server_port_ = FindFreePort();
+    std::string static_config_ = std::string{kStaticConfig} + GetConfigVarsPath();
+};
+
+class TaskTraceProducer final : public components::ComponentBase {
+public:
+    static constexpr std::string_view kName = "task-trace-producer";
+
+    TaskTraceProducer(const components::ComponentConfig& config, const components::ComponentContext& context)
+        : components::ComponentBase(config, context) {
+        // Task tracing is set up by ManagerControllerComponent.
+        // It may not work in constructors of components that don't depend on it.
+        [[maybe_unused]] const auto& manager_controller_component =
+            context.FindComponent<components::ManagerControllerComponent>();
+
+        // Task tracing is guaranteed to work for this task.
+        utils::Async(std::string{kName}, [] { engine::Yield(); }).Get();
+    }
 };
 
 }  // namespace
 
+template <>
+inline constexpr auto components::kConfigFileMode<TaskTraceProducer> = ConfigFileMode::kNotRequired;
+
 TEST_F(ServerMinimalComponentList, Basic) {
-  constexpr std::string_view kConfigVarsTemplate = R"(
-    runtime_config_path: {0}
+    constexpr std::string_view kConfigVarsTemplate = R"(
+    server-port: {0}
   )";
-  const auto config_vars =
-      fmt::format(kConfigVarsTemplate, GetRuntimeConfigPath());
+    const auto config_vars = fmt::format(kConfigVarsTemplate, GetServerPort());
 
-  fs::blocking::RewriteFileContents(GetRuntimeConfigPath(),
-                                    tests::kRuntimeConfig);
-  fs::blocking::RewriteFileContents(GetConfigVarsPath(), config_vars);
+    fs::blocking::RewriteFileContents(GetConfigVarsPath(), config_vars);
 
-  components::RunOnce(components::InMemoryConfig{GetStaticConfig()},
-                      components::MinimalServerComponentList());
+    components::RunOnce(components::InMemoryConfig{GetStaticConfig()}, components::MinimalServerComponentList());
 }
 
 TEST_F(ServerMinimalComponentList, TraceSwitching) {
-  constexpr std::string_view kConfigVarsTemplate = R"(
-    runtime_config_path: {0}
-    tracer_log_path: {1}
+    constexpr std::string_view kConfigVarsTemplate = R"(
+    tracer_log_path: {0}
+    server-port: {1}
   )";
-  const std::string logs_path = GetTempRoot() + "/tracing_log.txt";
-  const auto config_vars =
-      fmt::format(kConfigVarsTemplate, GetRuntimeConfigPath(), logs_path);
+    const std::string logs_path = GetTempRoot() + "/tracing_log.txt";
+    const auto config_vars = fmt::format(kConfigVarsTemplate, logs_path, GetServerPort());
 
-  fs::blocking::RewriteFileContents(GetRuntimeConfigPath(),
-                                    tests::kRuntimeConfig);
-  fs::blocking::RewriteFileContents(GetConfigVarsPath(), config_vars);
+    fs::blocking::RewriteFileContents(GetConfigVarsPath(), config_vars);
 
-  components::RunOnce(components::InMemoryConfig{GetStaticConfig()},
-                      components::MinimalServerComponentList());
+    components::RunOnce(
+        components::InMemoryConfig{GetStaticConfig()},
+        components::MinimalServerComponentList().Append<TaskTraceProducer>()
+    );
 
-  logging::LogFlush();
+    logging::LogFlush();
 
-  const auto logs = fs::blocking::ReadFileContents(logs_path);
-  EXPECT_NE(logs.find(" changed state to kQueued"), std::string::npos);
-  EXPECT_NE(logs.find(" changed state to kRunning"), std::string::npos);
-  EXPECT_NE(logs.find(" changed state to kCompleted"), std::string::npos);
-  EXPECT_EQ(logs.find("stacktrace= 0# "), std::string::npos);
+    const auto logs = fs::blocking::ReadFileContents(logs_path);
+    // Assert not to print all logs multiple times on failure.
+    ASSERT_THAT(logs, testing::HasSubstr(" changed state to kQueued"));
+    ASSERT_THAT(logs, testing::HasSubstr(" changed state to kRunning"));
+    ASSERT_THAT(logs, testing::HasSubstr(" changed state to kCompleted"));
+    ASSERT_THAT(logs, testing::Not(testing::HasSubstr("stacktrace= 0# ")));
 }
 
 TEST_F(ServerMinimalComponentList, TraceStacktraces) {
-  constexpr std::string_view kConfigVarsTemplate = R"(
-    runtime_config_path: {0}
-    tracer_log_path: {1}
+    constexpr std::string_view kConfigVarsTemplate = R"(
+    tracer_log_path: {0}
     tracer_level: debug
+    server-port: {1}
   )";
-  const std::string logs_path = GetTempRoot() + "/tracing_st_log.txt";
+    const std::string logs_path = GetTempRoot() + "/tracing_st_log.txt";
 
-  fs::blocking::RewriteFileContents(GetRuntimeConfigPath(),
-                                    tests::kRuntimeConfig);
-  fs::blocking::RewriteFileContents(
-      GetConfigVarsPath(),
-      fmt::format(kConfigVarsTemplate, GetRuntimeConfigPath(), logs_path));
+    fs::blocking::RewriteFileContents(
+        GetConfigVarsPath(), fmt::format(kConfigVarsTemplate, logs_path, GetServerPort())
+    );
 
-  components::RunOnce(components::InMemoryConfig{GetStaticConfig()},
-                      components::MinimalServerComponentList());
+    components::RunOnce(
+        components::InMemoryConfig{GetStaticConfig()},
+        components::MinimalServerComponentList().Append<TaskTraceProducer>()
+    );
 
-  logging::LogFlush();
+    logging::LogFlush();
 
-  const auto logs = fs::blocking::ReadFileContents(logs_path);
-  EXPECT_NE(logs.find(" changed state to kQueued"), std::string::npos);
-  EXPECT_NE(logs.find(" changed state to kRunning"), std::string::npos);
-  EXPECT_NE(logs.find(" changed state to kCompleted"), std::string::npos);
-  EXPECT_NE(logs.find("stacktrace= 0# "), std::string::npos);
+    const auto logs = fs::blocking::ReadFileContents(logs_path);
+    ASSERT_THAT(logs, testing::HasSubstr(" changed state to kQueued"));
+    ASSERT_THAT(logs, testing::HasSubstr(" changed state to kRunning"));
+    ASSERT_THAT(logs, testing::HasSubstr(" changed state to kCompleted"));
+    ASSERT_THAT(logs, testing::HasSubstr("stacktrace= 0# "));
 }
 
-TEST_F(ServerMinimalComponentList, MissingRuntimeConfigParam) {
-  constexpr std::string_view kConfigVarsTemplate = R"(
-    runtime_config_path: {0}
+TEST_F(ServerMinimalComponentList, InvalidDynamicConfigParam) {
+    constexpr std::string_view kConfigVarsTemplate = R"(
+    dynamic-config-default-overrides:
+      USERVER_LOG_DYNAMIC_DEBUG:
+        force-disabled: []
+        force-enabled: 42  # <== error
+    server-port: {0}
+    default-logger-path: {1}
   )";
-  const auto config_vars =
-      fmt::format(kConfigVarsTemplate, GetRuntimeConfigPath());
+    const auto logs_path = GetTempRoot() + "/log.txt";
 
-  fs::blocking::RewriteFileContents(GetRuntimeConfigPath(),
-                                    kRuntimeConfigMissingParam);
-  fs::blocking::RewriteFileContents(GetConfigVarsPath(), config_vars);
+    fs::blocking::RewriteFileContents(
+        GetConfigVarsPath(), fmt::format(kConfigVarsTemplate, GetServerPort(), logs_path)
+    );
 
-  UEXPECT_THROW_MSG(
-      components::RunOnce(components::InMemoryConfig{GetStaticConfig()},
-                          components::MinimalServerComponentList()),
-      std::exception, "USERVER_LOG_REQUEST_HEADERS");
+    // This is a golden test that shows how exactly dynamic config parsing failure
+    // may look. Feel free to change this test if those messages ever change.
+    const auto expected_exception_message = fmt::format(
+        "Cannot start component dynamic-config: {} while parsing dynamic config values. Error at path "
+        "'USERVER_LOG_DYNAMIC_DEBUG.force-enabled': Wrong type. Expected: arrayValue, actual: intValue",
+        // NOTE: GetTypeName(typeid(T)) for old version of compilators
+        compiler::GetTypeName(typeid(formats::json::TypeMismatchException))
+    );
+
+    UEXPECT_THROW_MSG(
+        components::RunOnce(components::InMemoryConfig{GetStaticConfig()}, components::MinimalServerComponentList()),
+        std::exception,
+        expected_exception_message
+    );
+
+    EXPECT_THAT(
+        fs::blocking::ReadFileContents(logs_path),
+        testing::HasSubstr("text=Loading failed: " + expected_exception_message)
+    );
 }
 
 USERVER_NAMESPACE_END
